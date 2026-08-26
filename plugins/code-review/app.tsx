@@ -14,7 +14,6 @@ import {
   experimental_useAppPanel,
   experimental_useFixedTabTarget,
   ThreadChat,
-  UrlLink,
   useBbNavigate,
   useRealtime,
   useRpc,
@@ -144,6 +143,51 @@ function EmptyState({
         <div className="max-w-md text-xs text-muted-foreground">{detail}</div>
       )}
     </div>
+  );
+}
+
+/**
+ * A link out to GitHub. Opens through BB's own URL routing — the in-app
+ * browser when this client prefers it — but stays a real anchor so copy-link
+ * and modifier-clicks still behave, which matters when you want to paste a
+ * file link into a review.
+ */
+function GithubLink({
+  href,
+  className,
+  title,
+  children,
+}: {
+  href: string;
+  className?: string;
+  title?: string;
+  children: ReactNode;
+}) {
+  const navigate = useBbNavigate();
+  return (
+    <a
+      href={href}
+      className={className}
+      title={title}
+      onClick={(event) => {
+        // Leave "open in a new tab" and friends to the browser.
+        if (
+          event.defaultPrevented ||
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey
+        ) {
+          return;
+        }
+        // A false return means this client will not handle the URL, so fall
+        // through to the anchor rather than swallowing the click.
+        if (navigate.openUrl(href)) event.preventDefault();
+      }}
+    >
+      {children}
+    </a>
   );
 }
 
@@ -662,13 +706,13 @@ function PrFindingsView({
             {pr?.title ?? `Pull request #${number}`}
           </h2>
           {pr === null ? null : (
-            <UrlLink
+            <GithubLink
               href={pr.url}
               className="mt-0.5 inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs transition-colors hover:bg-accent"
             >
               <Icon name="Github" className="size-3.5" />
               Open on GitHub
-            </UrlLink>
+            </GithubLink>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-xs text-muted-foreground">
@@ -769,25 +813,25 @@ function LocationCard({ location }: { location: LocationDto }) {
   return (
     <div className="overflow-hidden rounded-lg border border-border">
       <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/30 px-3 py-1.5">
-        <UrlLink
+        <GithubLink
           href={location.diffUrl}
           className="min-w-0 flex-1 truncate font-mono text-xs underline-offset-4 hover:underline"
           title={`Open ${location.file} in the pull request diff on GitHub`}
         >
           {locationLabel(location)}
-        </UrlLink>
+        </GithubLink>
         {location.isPrimary ? (
           <Badge variant="outline" className="shrink-0 border-border text-[10px]">
             this issue
           </Badge>
         ) : null}
-        <UrlLink
+        <GithubLink
           href={location.diffUrl}
           className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline-offset-4 hover:underline"
         >
           <Icon name="Github" className="size-3.5" />
           diff
-        </UrlLink>
+        </GithubLink>
       </div>
       {location.note === "" ? null : (
         <p className="border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
@@ -889,13 +933,13 @@ function FindingActions({
       <div className="flex flex-wrap items-center gap-2">
         {isPosted ? (
           finding.commentUrl === null ? null : (
-            <UrlLink
+            <GithubLink
               href={finding.commentUrl}
               className="inline-flex items-center gap-1.5 text-xs text-muted-foreground underline-offset-4 hover:underline"
             >
               <Icon name="ExternalLink" className="size-3.5" />
               View on GitHub
-            </UrlLink>
+            </GithubLink>
           )
         ) : (
           <>

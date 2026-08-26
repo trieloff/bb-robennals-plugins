@@ -469,3 +469,69 @@ describe("remembering where you were", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("links out to GitHub", () => {
+  const detailPath = "pr/acme/app/7/f/f1";
+
+  it("opens through BB's URL routing rather than a raw navigation", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: detailPath },
+      { rpc: rpc(), openUrl: () => true },
+    );
+    const link = await slot.findByText("src/a.ts:10-12");
+    fireEvent.click(link.closest("a") ?? link);
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({
+          method: "openUrl",
+          url: "https://github.com/acme/app/pull/7/files#diff-abc123R10",
+        }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("routes the PR link too", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7" },
+      { rpc: rpc(), openUrl: () => true },
+    );
+    const link = await slot.findByText("Open on GitHub");
+    fireEvent.click(link.closest("a") ?? link);
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({ method: "openUrl", url: "https://github.com/acme/app/pull/7" }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps a real href so the link can be copied or opened in a new tab", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const link = await slot.findByText("src/a.ts:10-12");
+    expect(link.closest("a")?.getAttribute("href")).toBe(
+      "https://github.com/acme/app/pull/7/files#diff-abc123R10",
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("leaves a modifier-click to the browser", async () => {
+    // Cmd-click means "new tab"; swallowing it would be worse than useless.
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: detailPath },
+      { rpc: rpc(), openUrl: () => true },
+    );
+    const link = await slot.findByText("src/a.ts:10-12");
+    fireEvent.click(link.closest("a") ?? link, { metaKey: true });
+    await waitFor(() => expect(slot.inspection.rpcCalls.length).toBeGreaterThan(0));
+    expect(slot.inspection.navigateCalls).toEqual([]);
+    slot.lifecycle.unmount();
+  });
+});
