@@ -56,7 +56,6 @@ const GH_HINT =
   "Install the GitHub CLI and run `gh auth login`, then reload the plugin.";
 const GH_HOST = "github.com";
 const GH_NO_CREDENTIALS = /no oauth token|not logged in/i;
-const PR_CACHE_MS = 5 * 60_000;
 const VIEWER_CACHE_MS = 60 * 60_000;
 const TEAM_CACHE_MS = 10 * 60_000;
 
@@ -189,7 +188,11 @@ export const rpcContract = defineRpcContract({
       filter: filterSchema,
       refresh: z.boolean().optional(),
     }),
-    output: z.object({ pullRequests: z.array(pullRequestSchema) }),
+    output: z.object({
+      /** When this list was last pulled from GitHub. */
+      fetchedAt: z.string(),
+      pullRequests: z.array(pullRequestSchema),
+    }),
   },
   getPullRequest: {
     input: z.object({ repo: z.string(), number: z.number().int().positive() }),
@@ -554,6 +557,13 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
      )`,
     `ALTER TABLE findings ADD COLUMN summary TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE findings ADD COLUMN references_json TEXT NOT NULL DEFAULT '[]'`,
+    // The PR list survives reloads and restarts, and is only re-fetched when
+    // the user asks for it.
+    `CREATE TABLE IF NOT EXISTS pr_cache (
+       repo TEXT PRIMARY KEY,
+       prs TEXT NOT NULL,
+       fetched_at TEXT NOT NULL
+     )`,
   ]);
 
   function getReview(reviewId: string): ReviewRow | null {
@@ -771,20 +781,42 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   // -------------------------------------------------------------------------
   // Pull requests
   // -------------------------------------------------------------------------
-  const prCache = new Map<string, { prs: PullRequest[]; at: number }>();
+  /**
+   * The stored PR list for a repo. Deliberately has no expiry: the panel shows
+   * what you last pulled until you press Refresh, so re-opening the tab is
+   * instant and never silently re-runs gh.
+   */
+  function storedPullRequests(repo: string): { prs: PullRequest[]; fetchedAt: string } | null {
+    const row = db.prepare(`SELECT prs, fetched_at FROM pr_cache WHERE repo = ?`).get(repo) as
+      | { prs: string; fetched_at: string }
+      | undefined;
+    if (row === undefined) return null;
+    try {
+      return { prs: JSON.parse(row.prs) as PullRequest[], fetchedAt: row.fetched_at };
+    } catch {
+      return null;
+    }
+  }
 
-  async function fetchPullRequests(repo: string, force = false): Promise<PullRequest[]> {
-    const cached = prCache.get(repo);
-    if (!force && cached !== undefined && Date.now() - cached.at < PR_CACHE_MS) {
-      return cached.prs;
+  async function fetchPullRequests(
+    repo: string,
+    force = false,
+  ): Promise<{ prs: PullRequest[]; fetchedAt: string }> {
+    if (!force) {
+      const stored = storedPullRequests(repo);
+      if (stored !== null) return stored;
     }
     const raw = await gh(
       ["pr", "list", "-R", repo, "--state", "open", "--limit", "100", "--json", PR_JSON_FIELDS],
       45_000,
     );
     const prs = parsePullRequests(raw, repo);
-    prCache.set(repo, { prs, at: Date.now() });
-    return prs;
+    const fetchedAt = nowIso();
+    db.prepare(
+      `INSERT INTO pr_cache (repo, prs, fetched_at) VALUES (?, ?, ?)
+       ON CONFLICT(repo) DO UPDATE SET prs = excluded.prs, fetched_at = excluded.fetched_at`,
+    ).run(repo, JSON.stringify(prs), fetchedAt);
+    return { prs, fetchedAt };
   }
 
   /** Attach this plugin's review state to the wire DTO. */
@@ -1296,13 +1328,14 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     async listPullRequests({ repo, filter, refresh }) {
       requireRepo(repo);
       await checkAuth();
-      const prs = await fetchPullRequests(repo, refresh === true);
+      const { prs, fetchedAt } = await fetchPullRequests(repo, refresh === true);
       const context = {
         viewer: await getViewer(),
         myTeams: await getMyTeams(),
       };
       const filtered = filterPullRequests(prs, filter, context);
       return {
+        fetchedAt,
         pullRequests: filtered
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
           .map(withReviewState),
@@ -1315,7 +1348,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     async getPullRequest({ repo, number }) {
       requireRepo(repo);
       await checkAuth();
-      const prs = await fetchPullRequests(repo);
+      const { prs } = await fetchPullRequests(repo);
       const pr = prs.find((candidate) => candidate.number === number) ?? null;
       const review = getReview(reviewIdFor(repo, number));
       return {

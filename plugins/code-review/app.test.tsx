@@ -535,3 +535,31 @@ describe("links out to GitHub", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("remembering the repo when status is slow", () => {
+  it("keeps the saved repo even though the repo list arrives later", async () => {
+    // Reproduction: in production `status` runs a gh auth probe and a teams
+    // lookup, so it lands seconds after `getPanelState`. The saved repo must
+    // not be discarded in the gap while the repo list is still empty.
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: rpc({
+          status: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            return { ...READY, repos: ["acme/other", "acme/app"] };
+          },
+          getPanelState: () => ({ repo: "acme/app", filter: { kind: "mine" } }),
+        }),
+      },
+    );
+    await slot.findByText("Add a thing");
+    const listCall = slot.inspection.rpcCalls
+      .filter((entry) => entry.method === "listPullRequests")
+      .at(-1);
+    expect((listCall?.input as { repo: string }).repo).toBe("acme/app");
+    slot.lifecycle.unmount();
+  });
+});

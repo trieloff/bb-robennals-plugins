@@ -278,16 +278,68 @@ describe("listPullRequests", () => {
     ).rejects.toThrow(/expected owner\/repo/);
   });
 
-  it("serves repeat calls from cache and refetches only on refresh", async () => {
+  it("only calls gh when the user asks, however long it has been", async () => {
+    // The list is what you last pulled until you press Refresh: re-opening the
+    // panel must never silently re-run gh.
     const { call, calls } = await makeHost();
     const listCalls = () =>
       calls.filter((entry) => entry.args[0] === "pr" && entry.args[1] === "list").length;
+
     await call("listPullRequests", { repo: REPO, filter: { kind: "all" } });
     const afterFirst = listCalls();
-    await call("listPullRequests", { repo: REPO, filter: { kind: "all" } });
+    expect(afterFirst).toBe(1);
+
+    for (let i = 0; i < 5; i += 1) {
+      await call("listPullRequests", { repo: REPO, filter: { kind: "all" } });
+    }
     expect(listCalls()).toBe(afterFirst);
+
     await call("listPullRequests", { repo: REPO, filter: { kind: "all" }, refresh: true });
     expect(listCalls()).toBe(afterFirst + 1);
+  });
+
+  it("reports when the list was last pulled", async () => {
+    const { call } = await makeHost();
+    const first = await call<{ fetchedAt: string }>("listPullRequests", {
+      repo: REPO,
+      filter: { kind: "all" },
+    });
+    expect(Number.isNaN(Date.parse(first.fetchedAt))) .toBe(false);
+
+    const cached = await call<{ fetchedAt: string }>("listPullRequests", {
+      repo: REPO,
+      filter: { kind: "all" },
+    });
+    // A cached read reports the original fetch time, not "now".
+    expect(cached.fetchedAt).toBe(first.fetchedAt);
+  });
+
+  it("stores the list in the plugin database, not just in memory", async () => {
+    // Durability is the point: the panel must survive a reload or a restart.
+    // The fake host closes every database handle on reload, so this asserts
+    // the row is on disk; the reload itself is verified against a live server.
+    const host = await makeHost();
+    await host.call("listPullRequests", { repo: REPO, filter: { kind: "all" } });
+    const row = host.bb.storage
+      .database()
+      .prepare(`SELECT prs, fetched_at FROM pr_cache WHERE repo = ?`)
+      .get(REPO) as { prs: string; fetched_at: string } | undefined;
+    expect(row).toBeDefined();
+    expect(JSON.parse(row?.prs ?? "[]")).toHaveLength(1);
+    expect(Number.isNaN(Date.parse(row?.fetched_at ?? ""))).toBe(false);
+  });
+
+  it("still reflects review state changes without re-fetching the list", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await host.call("listPullRequests", { repo: REPO, filter: { kind: "all" } });
+    const before = host.calls.filter((entry) => entry.args[1] === "list").length;
+    await runReview(host);
+    const after = await host.call<{
+      pullRequests: Array<{ reviewStatus: string; openFindings: number }>;
+    }>("listPullRequests", { repo: REPO, filter: { kind: "all" } });
+    expect(after.pullRequests[0]?.reviewStatus).toBe("reported");
+    expect(after.pullRequests[0]?.openFindings).toBe(1);
+    expect(host.calls.filter((entry) => entry.args[1] === "list").length).toBe(before);
   });
 });
 

@@ -191,6 +191,19 @@ function GithubLink({
   );
 }
 
+/** "just now" / "12m ago" / "3h ago" / "2d ago". */
+function relativeTime(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
 function locationLabel(target: {
   file: string;
   startLine: number | null;
@@ -403,7 +416,7 @@ function PrListView({
   const { data, error, isLoading, refetch } = useLiveQuery(
     async () =>
       repo === null
-        ? { pullRequests: [] as PullRequestDto[] }
+        ? { fetchedAt: "", pullRequests: [] as PullRequestDto[] }
         : rpc.call("listPullRequests", { repo, filter }),
     [rpc, repo, filterKey],
   );
@@ -493,6 +506,12 @@ function PrListView({
           />
           Refresh
         </Button>
+        {/* The list never refreshes on its own now, so say how old it is. */}
+        {data?.fetchedAt ? (
+          <span className="text-xs text-muted-foreground">
+            updated {relativeTime(data.fetchedAt)}
+          </span>
+        ) : null}
       </div>
 
       {tab === "teams" && myTeams.length === 0 ? (
@@ -1184,6 +1203,7 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
 
   const status = useLiveQuery(() => rpc.call("status"), [rpc]);
   const repos = useMemo(() => status.data?.repos ?? [], [status.data]);
+  const hasRepos = status.data !== null;
 
   // Repo and filter live on the server, so re-opening the tab resumes instead
   // of asking again.
@@ -1207,13 +1227,19 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
     };
   }, [rpc]);
 
-  // Only fall back to the first known repo once the saved one has had its say.
+  // Fall back to the first known repo only once BOTH the saved repo and the
+  // repo list have arrived. `status` runs a gh auth probe, so it lands well
+  // after `getPanelState`; acting on an empty list in that gap threw the saved
+  // repo away and always landed on the first one.
+  const repoKey = repos.join("\n");
   useEffect(() => {
-    if (!isRestored) return;
+    if (!isRestored || !hasRepos) return;
     setRepo((current) =>
       current !== null && repos.includes(current) ? current : (repos[0] ?? null),
     );
-  }, [isRestored, repos]);
+    // `repos` is rebuilt on every status refetch; its contents are what matter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRestored, hasRepos, repoKey]);
 
   const persist = useCallback(
     (next: { repo?: string; filter?: PrFilter }) => {
