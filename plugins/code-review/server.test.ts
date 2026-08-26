@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import plugin, { type FindingDto, type ReviewDto } from "./server";
@@ -96,6 +97,13 @@ async function makeHost(
     "pr diff":
       "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b",
     "api -X": JSON.stringify({ html_url: "https://github.com/acme/app/pull/7#c1" }),
+    "api repos/acme/app/contents": JSON.stringify({
+      encoding: "base64",
+      content: Buffer.from(
+        Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n"),
+        "utf8",
+      ).toString("base64"),
+    }),
     ...options.ghOverrides,
   };
 
@@ -284,36 +292,30 @@ describe("listPullRequests", () => {
 });
 
 describe("getPullRequest", () => {
-  it("splits the diff into one patch per file", async () => {
-    const { call } = await makeHost();
-    const detail = await call<{
-      files: Array<{ path: string; patch: string }>;
+  it("is a cheap read: no diff fetch, because the panel shows issues", async () => {
+    // The diff lives on GitHub and the reviewed snapshot is already stored, so
+    // viewing a PR must not cost a `gh pr diff` every time.
+    const host = await makeHost();
+    const before = host.calls.filter((entry) => entry.args.join(" ").startsWith("pr diff")).length;
+    const detail = await host.call<{
+      pullRequest: { title: string } | null;
       review: ReviewDto | null;
-      diffError: string | null;
     }>("getPullRequest", { repo: REPO, number: 7 });
-    expect(detail.files.map((file) => file.path)).toEqual(["src/a.ts"]);
-    expect(detail.diffError).toBeNull();
+    expect(detail.pullRequest?.title).toBe("Add a thing");
     expect(detail.review).toBeNull();
+    const after = host.calls.filter((entry) => entry.args.join(" ").startsWith("pr diff")).length;
+    expect(after).toBe(before);
   });
 
-  it("still returns the PR and its findings when the diff cannot be fetched", async () => {
-    // An unfetchable diff must not take the findings down with it — the diff
-    // is the least important thing on the page.
+  it("returns the PR's findings once a review has reported", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     await runReview(host);
-    // The review already has its own fetched snapshot; only browsing the live
-    // diff should be affected.
-    host.failures["pr diff"] = "boom";
-    const detail = await host.call<{
-      files: unknown[];
-      diffError: string | null;
-      findings: FindingDto[];
-      pullRequest: { title: string } | null;
-    }>("getPullRequest", { repo: REPO, number: 7 });
-    expect(detail.files).toEqual([]);
-    expect(detail.diffError).toContain("boom");
+    const detail = await host.call<{ review: ReviewDto; findings: FindingDto[] }>(
+      "getPullRequest",
+      { repo: REPO, number: 7 },
+    );
+    expect(detail.review.status).toBe("reported");
     expect(detail.findings).toHaveLength(1);
-    expect(detail.pullRequest?.title).toBe("Add a thing");
   });
 });
 
@@ -787,6 +789,173 @@ describe("serving the PR to the review agent", () => {
   });
 });
 
+describe("the code an issue points at", () => {
+  it("returns the finding's own site with real file line numbers", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const code = await host.call<{
+      prUrl: string;
+      locations: Array<{
+        file: string;
+        firstLine: number;
+        lines: string[];
+        isPrimary: boolean;
+        diffUrl: string;
+        error: string | null;
+      }>;
+    }>("getFindingCode", { findingId: finding?.id, context: 2 });
+
+    expect(code.prUrl).toBe("https://github.com/acme/app/pull/7");
+    const primary = code.locations.find((location) => location.isPrimary);
+    expect(primary?.file).toBe("src/a.ts");
+    // Cited lines are 10-12, context 2, so the window starts at line 8.
+    expect(primary?.firstLine).toBe(8);
+    expect(primary?.lines[0]).toBe("line 8");
+    expect(primary?.lines.at(-1)).toBe("line 14");
+    expect(primary?.error).toBeNull();
+  });
+
+  it("anchors the GitHub link at the file and line, the way GitHub does", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ diffUrl: string }> }>("getFindingCode", {
+      findingId: finding?.id,
+    });
+    // GitHub anchors a PR file by sha256 of its repo-relative path.
+    const digest = createHash("sha256").update("src/a.ts").digest("hex");
+    expect(code.locations[0]?.diffUrl).toBe(
+      `https://github.com/acme/app/pull/7/files#diff-${digest}R10`,
+    );
+  });
+
+  it("clamps the window to the start of the file", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report([{ ...FINDING, startLine: 1, endLine: 1 }]) },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{
+      locations: Array<{ firstLine: number; hasMoreAbove: boolean; hasMoreBelow: boolean }>;
+    }>("getFindingCode", { findingId: finding?.id, context: 5 });
+    expect(code.locations[0]?.firstLine).toBe(1);
+    expect(code.locations[0]?.hasMoreAbove).toBe(false);
+    expect(code.locations[0]?.hasMoreBelow).toBe(true);
+  });
+
+  it("also shows files the finding cited in prose", async () => {
+    // Agents cite supporting code inline far more often than they fill in a
+    // structured field, and that code is worth showing.
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          { ...FINDING, problem: "This contradicts src/other.ts:20-22, which retries." },
+        ]),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ file: string; isPrimary: boolean }> }>(
+      "getFindingCode",
+      { findingId: finding?.id },
+    );
+    expect(code.locations.map((location) => location.file)).toEqual([
+      "src/a.ts",
+      "src/other.ts",
+    ]);
+    expect(code.locations[1]?.isPrimary).toBe(false);
+  });
+
+  it("shows an explicit reference with the note that explains it", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          {
+            ...FINDING,
+            references: [
+              { file: "src/ref.ts", startLine: 5, endLine: 6, note: "the pattern to match" },
+            ],
+          },
+        ]),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ file: string; note: string }> }>(
+      "getFindingCode",
+      { findingId: finding?.id },
+    );
+    expect(code.locations[1]?.file).toBe("src/ref.ts");
+    expect(code.locations[1]?.note).toBe("the pattern to match");
+  });
+
+  it("reports a file it cannot read as a note, not a failed request", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghFailures: { "api repos/acme/app/contents": "404 Not Found" },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ error: string | null; lines: string[] }> }>(
+      "getFindingCode",
+      { findingId: finding?.id },
+    );
+    expect(code.locations[0]?.error).toContain("404");
+    expect(code.locations[0]?.lines).toEqual([]);
+  });
+
+  it("fetches each file once and serves the rest from cache", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const contentCalls = () =>
+      host.calls.filter((entry) => entry.args.join(" ").includes("/contents/")).length;
+    await host.call("getFindingCode", { findingId: finding?.id });
+    const afterFirst = contentCalls();
+    expect(afterFirst).toBeGreaterThan(0);
+    await host.call("getFindingCode", { findingId: finding?.id, context: 25 });
+    expect(contentCalls()).toBe(afterFirst);
+  });
+
+  it("drops cached file bodies when the review is re-run", async () => {
+    // A re-run may sit on a newer commit, where the same path has other lines.
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("getFindingCode", { findingId: finding?.id });
+    const before = host.calls.filter((entry) => entry.args.join(" ").includes("/contents/")).length;
+    await runReview(host);
+    const [refreshed] = await host.findings();
+    await host.call("getFindingCode", { findingId: refreshed?.id });
+    expect(
+      host.calls.filter((entry) => entry.args.join(" ").includes("/contents/")).length,
+    ).toBeGreaterThan(before);
+  });
+});
+
+describe("the panel's remembered state", () => {
+  it("starts empty and round-trips what the panel saves", async () => {
+    const host = await makeHost();
+    expect(await host.call("getPanelState", null)).toEqual({ repo: null, filter: null });
+
+    await host.call("setPanelState", { repo: REPO, filter: { kind: "team", teamSlug: "acme/core" } });
+    expect(await host.call("getPanelState", null)).toEqual({
+      repo: REPO,
+      filter: { kind: "team", teamSlug: "acme/core" },
+    });
+  });
+
+  it("overwrites rather than accumulating", async () => {
+    const host = await makeHost();
+    await host.call("setPanelState", { repo: REPO, filter: { kind: "mine" } });
+    await host.call("setPanelState", { repo: "acme/other", filter: { kind: "all" } });
+    expect(await host.call("getPanelState", null)).toEqual({
+      repo: "acme/other",
+      filter: { kind: "all" },
+    });
+  });
+
+  it("ignores a stored filter a newer build no longer understands", async () => {
+    const host = await makeHost();
+    await host.call("setPanelState", { repo: REPO, filter: { kind: "mine" } });
+    host.bb.storage.database().prepare(`UPDATE panel_state SET filter = ?`).run('{"kind":"gone"}');
+    expect(await host.call("getPanelState", null)).toEqual({ repo: REPO, filter: null });
+  });
+});
+
 describe("registrations", () => {
   it("registers the panel's data plane, the CLI, and the idle handler", async () => {
     const { harness } = await makeHost();
@@ -810,6 +979,9 @@ describe("registrations", () => {
       "schema",
       "submit",
     ]);
+    for (const method of ["getFindingCode", "getPanelState", "setPanelState"]) {
+      expect(harness.registrations.rpcMethods).toContain(method);
+    }
     expect(harness.registrations.threadEventHandlers["thread.idle"]).toBe(1);
   });
 });

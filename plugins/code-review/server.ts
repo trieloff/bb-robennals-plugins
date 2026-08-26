@@ -13,7 +13,7 @@
 //
 // gh is the only GitHub transport, so whatever `gh auth` can see, this can.
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -24,8 +24,12 @@ import {
   buildReviewPrompt,
   CLI_OUTPUT_BUDGET,
   FINDINGS_SCHEMA_TEXT,
+  findingGist,
+  findingLocations,
   formatContext,
   formatFileList,
+  githubPrFileUrl,
+  githubPrUrl,
   filterPullRequests,
   isRepoName,
   parseGithubRemote,
@@ -42,6 +46,7 @@ import {
   splitUnifiedDiff,
   type Finding,
   type FilePatch,
+  type FindingLocation,
   type PrSnapshot,
   type PullRequest,
 } from "./review-core";
@@ -51,7 +56,7 @@ const GH_HINT =
   "Install the GitHub CLI and run `gh auth login`, then reload the plugin.";
 const GH_HOST = "github.com";
 const GH_NO_CREDENTIALS = /no oauth token|not logged in/i;
-const PR_CACHE_MS = 60_000;
+const PR_CACHE_MS = 5 * 60_000;
 const VIEWER_CACHE_MS = 60 * 60_000;
 const TEAM_CACHE_MS = 10 * 60_000;
 
@@ -97,6 +102,9 @@ const findingSchemaDto = z.object({
   severity: z.enum(SEVERITIES),
   category: z.string(),
   title: z.string(),
+  /** The gist for the list view; derived when the agent wrote none. */
+  gist: z.string(),
+  summary: z.string(),
   background: z.string(),
   problem: z.string(),
   suggestedFix: z.string(),
@@ -107,6 +115,14 @@ const findingSchemaDto = z.object({
   commentUrl: z.string().nullable(),
   postedAt: z.string().nullable(),
   discussionThreadId: z.string().nullable(),
+  references: z.array(
+    z.object({
+      file: z.string(),
+      startLine: z.number().nullable(),
+      endLine: z.number().nullable(),
+      note: z.string(),
+    }),
+  ),
 });
 export type FindingDto = z.infer<typeof findingSchemaDto>;
 
@@ -142,6 +158,29 @@ const filterSchema = z.union([
   z.object({ kind: z.literal("team"), teamSlug: z.string() }),
 ]);
 
+const codeLocationSchema = z.object({
+  file: z.string(),
+  startLine: z.number().nullable(),
+  endLine: z.number().nullable(),
+  note: z.string(),
+  isPrimary: z.boolean(),
+  /** The PR's diff for this file, anchored at the cited line. */
+  diffUrl: z.string(),
+  /** First line number in `lines`; 1-based. */
+  firstLine: z.number(),
+  lines: z.array(z.string()),
+  /** Lines exist above/below what was returned. */
+  hasMoreAbove: z.boolean(),
+  hasMoreBelow: z.boolean(),
+  /** Why the code could not be shown, if it could not. */
+  error: z.string().nullable(),
+});
+
+const panelStateSchema = z.object({
+  repo: z.string().nullable(),
+  filter: filterSchema.nullable(),
+});
+
 export const rpcContract = defineRpcContract({
   status: { input: z.null(), output: statusSchema },
   listPullRequests: {
@@ -156,9 +195,6 @@ export const rpcContract = defineRpcContract({
     input: z.object({ repo: z.string(), number: z.number().int().positive() }),
     output: z.object({
       pullRequest: pullRequestSchema.nullable(),
-      body: z.string(),
-      files: z.array(z.object({ path: z.string(), patch: z.string() })),
-      diffError: z.string().nullable(),
       review: reviewSchema.nullable(),
       findings: z.array(findingSchemaDto),
     }),
@@ -195,6 +231,19 @@ export const rpcContract = defineRpcContract({
     input: z.object({ findingId: z.string() }),
     output: z.object({ threadId: z.string() }),
   },
+  getFindingCode: {
+    input: z.object({
+      findingId: z.string(),
+      /** Lines of surrounding context above and below each cited range. */
+      context: z.number().int().min(0).max(200).optional(),
+    }),
+    output: z.object({
+      prUrl: z.string(),
+      locations: z.array(codeLocationSchema),
+    }),
+  },
+  getPanelState: { input: z.null(), output: panelStateSchema },
+  setPanelState: { input: panelStateSchema, output: panelStateSchema },
 });
 
 // ---------------------------------------------------------------------------
@@ -299,6 +348,7 @@ interface FindingRow {
   severity: string;
   category: string;
   title: string;
+  summary: string;
   background: string;
   problem: string;
   suggested_fix: string;
@@ -308,6 +358,7 @@ interface FindingRow {
   comment_url: string | null;
   posted_at: string | null;
   discussion_thread_id: string | null;
+  references_json: string;
 }
 
 function toReviewDto(row: ReviewRow): ReviewDto {
@@ -340,6 +391,8 @@ function toFindingDto(row: FindingRow): FindingDto {
     severity: isSeverity(row.severity) ? row.severity : "medium",
     category: row.category,
     title: row.title,
+    summary: row.summary ?? "",
+    gist: findingGist({ summary: row.summary ?? "", problem: row.problem }),
     background: row.background,
     problem: row.problem,
     suggestedFix: row.suggested_fix,
@@ -350,7 +403,19 @@ function toFindingDto(row: FindingRow): FindingDto {
     commentUrl: row.comment_url,
     postedAt: row.posted_at,
     discussionThreadId: row.discussion_thread_id,
+    references: parseJsonArray(row.references_json),
   };
+}
+
+/** Stored JSON that predates a column, or was written by an older build. */
+function parseJsonArray<T>(raw: string | null | undefined): T[] {
+  if (raw == null || raw === "") return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +535,25 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        diff TEXT NOT NULL DEFAULT '',
        fetched_at TEXT NOT NULL
      )`,
+    // File bodies at the reviewed commit, so the panel can show the code a
+    // finding points at without refetching on every render.
+    `CREATE TABLE IF NOT EXISTS review_files (
+       review_id TEXT NOT NULL,
+       path TEXT NOT NULL,
+       content TEXT,
+       error TEXT,
+       fetched_at TEXT NOT NULL,
+       PRIMARY KEY (review_id, path)
+     )`,
+    // Panel state, so re-opening the tab does not mean re-choosing the repo.
+    `CREATE TABLE IF NOT EXISTS panel_state (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       repo TEXT,
+       filter TEXT,
+       updated_at TEXT NOT NULL
+     )`,
+    `ALTER TABLE findings ADD COLUMN summary TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE findings ADD COLUMN references_json TEXT NOT NULL DEFAULT '[]'`,
   ]);
 
   function getReview(reviewId: string): ReviewRow | null {
@@ -791,6 +875,9 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     // has: posted comments are history, and dismissals are a decision the user
     // should not have to make twice.
     db.prepare(`DELETE FROM findings WHERE review_id = ? AND state = 'open'`).run(reviewId);
+    // Cached file bodies belong to the commit that was reviewed; a re-run may
+    // be on a newer one.
+    db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
 
     const timestamp = nowIso();
     db.prepare(
@@ -874,14 +961,17 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       .get(reviewId) as { n: number };
     const insert = db.prepare(
       `INSERT INTO findings (id, review_id, ord, file, start_line, end_line, side, severity,
-                             category, title, background, problem, suggested_fix,
-                             suggested_comment, draft_comment, state)
+                             category, title, summary, background, problem, suggested_fix,
+                             suggested_comment, references_json, draft_comment, state)
        VALUES (@id, @review_id, @ord, @file, @start_line, @end_line, @side, @severity,
-               @category, @title, @background, @problem, @suggested_fix,
-               @suggested_comment, NULL, 'open')`,
+               @category, @title, @summary, @background, @problem, @suggested_fix,
+               @suggested_comment, @references_json, NULL, 'open')`,
     );
     const write = db.transaction((rows: Finding[]) => {
       db.prepare(`DELETE FROM findings WHERE review_id = ? AND state = 'open'`).run(reviewId);
+    // Cached file bodies belong to the commit that was reviewed; a re-run may
+    // be on a newer one.
+    db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
       rows.forEach((finding, index) => {
         insert.run({
           id: randomUUID(),
@@ -894,10 +984,12 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           severity: finding.severity,
           category: finding.category,
           title: finding.title,
+          summary: finding.summary,
           background: finding.background,
           problem: finding.problem,
           suggested_fix: finding.suggestedFix,
           suggested_comment: finding.suggestedComment,
+          references_json: JSON.stringify(finding.references),
         });
       });
     });
@@ -1034,6 +1126,147 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   });
 
   // -------------------------------------------------------------------------
+  // The code a finding points at
+  // -------------------------------------------------------------------------
+
+  /**
+   * A file's body at the reviewed commit, cached per review. Fetched from
+   * GitHub rather than a checkout because the panel has no worktree, and
+   * because the reviewed commit is what the finding's line numbers refer to.
+   */
+  async function fileContent(
+    reviewId: string,
+    repo: string,
+    sha: string,
+    filePath: string,
+  ): Promise<{ content: string | null; error: string | null }> {
+    const cached = db
+      .prepare(`SELECT content, error FROM review_files WHERE review_id = ? AND path = ?`)
+      .get(reviewId, filePath) as { content: string | null; error: string | null } | undefined;
+    if (cached !== undefined) return cached;
+
+    let content: string | null = null;
+    let error: string | null = null;
+    try {
+      const raw = await gh(
+        [
+          "api",
+          `repos/${repo}/contents/${filePath.split("/").map(encodeURIComponent).join("/")}?ref=${sha}`,
+        ],
+        30_000,
+      );
+      const parsed = JSON.parse(raw) as { content?: unknown; encoding?: unknown };
+      if (typeof parsed.content !== "string") {
+        error = `${filePath} is not a readable file at ${sha.slice(0, 12)}.`;
+      } else {
+        content =
+          parsed.encoding === "base64"
+            ? Buffer.from(parsed.content, "base64").toString("utf8")
+            : parsed.content;
+      }
+    } catch (cause) {
+      // A cited file may simply not exist at that commit — the agent may have
+      // named it loosely. That is a per-file note, not a failed request.
+      error = cause instanceof Error ? cause.message : String(cause);
+    }
+    db.prepare(
+      `INSERT INTO review_files (review_id, path, content, error, fetched_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(review_id, path) DO UPDATE SET
+         content = excluded.content, error = excluded.error, fetched_at = excluded.fetched_at`,
+    ).run(reviewId, filePath, content, error, nowIso());
+    return { content, error };
+  }
+
+  function pathDigest(filePath: string): string {
+    return createHash("sha256").update(filePath).digest("hex");
+  }
+
+  async function findingCode(findingId: string, context: number) {
+    const row = requireFinding(findingId);
+    const finding = toFindingDto(row);
+    const review = getReview(finding.reviewId);
+    if (review === null) throw new Error(`No review for finding ${findingId}.`);
+    const snapshot = getContext(finding.reviewId)?.snapshot ?? null;
+    const sha = snapshot?.headSha ?? "";
+
+    const locations: FindingLocation[] = findingLocations({
+      file: finding.file,
+      startLine: finding.startLine,
+      endLine: finding.endLine,
+      summary: finding.summary,
+      background: finding.background,
+      problem: finding.problem,
+      suggestedFix: finding.suggestedFix,
+      references: finding.references,
+    });
+
+    const resolved = await Promise.all(
+      locations.map(async (location) => {
+        const diffUrl = githubPrFileUrl({
+          repo: review.repo,
+          number: review.number,
+          pathDigest: pathDigest(location.file),
+          line: location.startLine,
+          side: finding.side,
+        });
+        const base = { ...location, diffUrl, firstLine: 1, lines: [] as string[] };
+        if (sha === "") {
+          return {
+            ...base,
+            hasMoreAbove: false,
+            hasMoreBelow: false,
+            error: "This review has no fetched commit; re-run it to see the code.",
+          };
+        }
+        const { content, error } = await fileContent(
+          finding.reviewId,
+          review.repo,
+          sha,
+          location.file,
+        );
+        if (content === null) {
+          return { ...base, hasMoreAbove: false, hasMoreBelow: false, error };
+        }
+        const all = content.split("\n");
+        // No line anchor means the whole file is the subject; show the head of
+        // it rather than nothing.
+        const start = location.startLine ?? 1;
+        const end = location.endLine ?? start;
+        const from = Math.max(1, start - context);
+        const to = Math.min(all.length, end + context);
+        return {
+          ...base,
+          firstLine: from,
+          lines: all.slice(from - 1, to),
+          hasMoreAbove: from > 1,
+          hasMoreBelow: to < all.length,
+          error: null,
+        };
+      }),
+    );
+    return { prUrl: githubPrUrl(review.repo, review.number), locations: resolved };
+  }
+
+  // -------------------------------------------------------------------------
+  // Panel state, so re-opening the tab resumes where it left off
+  // -------------------------------------------------------------------------
+  function readPanelState() {
+    const row = db.prepare(`SELECT repo, filter FROM panel_state WHERE id = 1`).get() as
+      | { repo: string | null; filter: string | null }
+      | undefined;
+    if (row === undefined) return { repo: null, filter: null };
+    let filter: unknown = null;
+    try {
+      filter = row.filter === null ? null : JSON.parse(row.filter);
+    } catch {
+      filter = null;
+    }
+    const parsed = filterSchema.safeParse(filter);
+    return { repo: row.repo, filter: parsed.success ? parsed.data : null };
+  }
+
+  // -------------------------------------------------------------------------
   // RPC
   // -------------------------------------------------------------------------
   bb.rpc.register(rpcContract, {
@@ -1076,26 +1309,17 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       };
     },
 
+    // The panel shows issues, not the diff — the diff lives on GitHub, one
+    // click away, and the reviewed snapshot is already stored. So this stays a
+    // cheap read rather than a per-view `gh pr diff`.
     async getPullRequest({ repo, number }) {
       requireRepo(repo);
       await checkAuth();
       const prs = await fetchPullRequests(repo);
       const pr = prs.find((candidate) => candidate.number === number) ?? null;
-      const [bodyResult, diffResult] = await Promise.allSettled([
-        gh(["pr", "view", String(number), "-R", repo, "--json", "body", "--jq", ".body"], 30_000),
-        gh(["pr", "diff", String(number), "-R", repo], 60_000),
-      ]);
       const review = getReview(reviewIdFor(repo, number));
       return {
         pullRequest: pr === null ? null : withReviewState(pr),
-        body: bodyResult.status === "fulfilled" ? bodyResult.value.trim() : "",
-        files: diffResult.status === "fulfilled" ? splitUnifiedDiff(diffResult.value) : [],
-        diffError:
-          diffResult.status === "rejected"
-            ? diffResult.reason instanceof Error
-              ? diffResult.reason.message
-              : String(diffResult.reason)
-            : null,
         review: review === null ? null : toReviewDto(review),
         findings: review === null ? [] : listFindings(review.id),
       };
@@ -1131,6 +1355,27 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
 
     async discussFinding({ findingId }) {
       return { threadId: await discussFinding(findingId) };
+    },
+
+    async getFindingCode({ findingId, context }) {
+      await checkAuth();
+      return findingCode(findingId, context ?? 3);
+    },
+
+    getPanelState() {
+      return readPanelState();
+    },
+
+    setPanelState({ repo, filter }) {
+      db.prepare(
+        `INSERT INTO panel_state (id, repo, filter, updated_at) VALUES (1, @repo, @filter, @updated_at)
+         ON CONFLICT(id) DO UPDATE SET repo = @repo, filter = @filter, updated_at = @updated_at`,
+      ).run({
+        repo,
+        filter: filter === null ? null : JSON.stringify(filter),
+        updated_at: nowIso(),
+      });
+      return readPanelState();
     },
   });
 

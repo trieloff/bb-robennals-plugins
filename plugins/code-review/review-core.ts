@@ -17,6 +17,15 @@ export function severityRank(severity: string): number {
   return index === -1 ? SEVERITIES.length : index;
 }
 
+export const referenceSchema = z.object({
+  file: z.string().trim().min(1),
+  startLine: z.number().int().positive().nullable(),
+  endLine: z.number().int().positive().nullable(),
+  /** Why this location matters to the finding. */
+  note: z.string().trim(),
+});
+export type Reference = z.infer<typeof referenceSchema>;
+
 export const findingSchema = z.object({
   /** Repo-relative path of the file the finding is about. */
   file: z.string().trim().min(1),
@@ -28,6 +37,8 @@ export const findingSchema = z.object({
   severity: z.enum(SEVERITIES),
   category: z.string().trim(),
   title: z.string().trim().min(1),
+  /** The gist, for the list view: at most a few sentences. */
+  summary: z.string().trim(),
   /** What the code is doing — the context needed to understand the issue. */
   background: z.string().trim(),
   /** What is actually wrong. */
@@ -35,6 +46,8 @@ export const findingSchema = z.object({
   suggestedFix: z.string().trim(),
   /** Ready-to-post review comment text. */
   suggestedComment: z.string().trim().min(1),
+  /** Other places in the repo this finding depends on or points at. */
+  references: z.array(referenceSchema),
 });
 export type Finding = z.infer<typeof findingSchema>;
 
@@ -99,7 +112,8 @@ export function normalizeFinding(input: unknown): unknown {
       ? severity
       : "medium",
     category: firstString(row, ["category", "kind", "type"]),
-    title: firstString(row, ["title", "summary", "headline"]),
+    title: firstString(row, ["title", "headline"]),
+    summary: firstString(row, ["summary", "gist", "shortDescription"]),
     background: firstString(row, ["background", "context"]),
     problem: firstString(row, ["problem", "issue", "description", "detail"]),
     suggestedFix: firstString(row, ["suggestedFix", "suggested_fix", "fix"]),
@@ -108,7 +122,33 @@ export function normalizeFinding(input: unknown): unknown {
       "suggested_comment",
       "comment",
     ]),
+    references: normalizeReferences(row.references ?? row.related ?? row.seeAlso),
   };
+}
+
+function normalizeReferences(input: unknown): Reference[] {
+  if (!Array.isArray(input)) return [];
+  const references: Reference[] = [];
+  for (const entry of input) {
+    if (typeof entry === "string") {
+      // A bare "path/to/file.ts:12-18" is a perfectly clear reference.
+      references.push(...extractCitations(entry).map((cite) => ({ ...cite, note: "" })));
+      continue;
+    }
+    if (typeof entry !== "object" || entry === null) continue;
+    const row = entry as Record<string, unknown>;
+    const file = firstString(row, ["file", "path", "filename"]);
+    if (file === "") continue;
+    const start = firstLine(row, ["startLine", "start_line", "line", "lineStart"]);
+    const end = firstLine(row, ["endLine", "end_line", "lineEnd", "line"]);
+    references.push({
+      file,
+      startLine: start,
+      endLine: end !== null && start !== null && end < start ? start : end,
+      note: firstString(row, ["note", "why", "reason", "description"]),
+    });
+  }
+  return references;
 }
 
 export interface ParsedReport {
@@ -176,10 +216,15 @@ export const FINDINGS_SCHEMA_TEXT = `{
       "severity": "blocker|high|medium|low|nit",
       "category": "correctness",           // free-form, e.g. correctness, security, tests, naming
       "title": "Session token is compared non-constant-time",
+      "summary": "The gist, for the list view. Two sentences at most.",
       "background": "What this code does and the context a reader needs.",
       "problem": "What is actually wrong, and why it matters.",
       "suggestedFix": "How you would fix it.",
-      "suggestedComment": "The exact review comment text to post on the PR."
+      "suggestedComment": "The exact review comment text to post on the PR.",
+      "references": [                      // other code that supports the finding
+        { "file": "src/server/session.ts", "startLine": 88, "endLine": 92,
+          "note": "the comparison this one should match" }
+      ]
     }
   ]
 }`;
@@ -760,4 +805,157 @@ export function formatFileList(reviewId: string, files: FilePatch[]): string {
       (file) => `    bb code-review diff --review ${reviewId} --file ${file.path}`,
     ),
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Where a finding points
+// ---------------------------------------------------------------------------
+
+/** Extensions a `path:line` citation is allowed to end in. Without this,
+ *  "github.com:443" and similar read as file references. */
+const SOURCE_EXTENSIONS = new Set([
+  "bash", "c", "cc", "cjs", "conf", "cpp", "cs", "css", "dart", "ex", "exs",
+  "go", "gql", "gradle", "graphql", "h", "hpp", "html", "ini", "java", "js",
+  "json", "jsx", "kt", "kts", "less", "lua", "m", "md", "mdx", "mjs", "mm",
+  "php", "pl", "proto", "py", "r", "rb", "rs", "sass", "scala", "scss", "sh",
+  "sql", "svelte", "swift", "tf", "toml", "ts", "tsx", "vue", "xml", "yaml",
+  "yml", "zsh",
+]);
+
+const CITATION = /((?:[\w.@-]+\/)*[\w.@-]+\.([A-Za-z0-9]{1,8})):(\d+)(?:\s*(?:-|–|to)\s*(\d+))?/g;
+
+export interface Citation {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+}
+
+/**
+ * Pull `path/to/file.ts:42` / `file.ts:42-48` references out of prose. Agents
+ * cite supporting code inline far more often than they fill in a structured
+ * field, and those citations are exactly the code worth showing next to the
+ * finding.
+ */
+export function extractCitations(text: string): Citation[] {
+  const found: Citation[] = [];
+  for (const match of text.matchAll(CITATION)) {
+    const [whole, file, extension, start, end] = match;
+    if (!SOURCE_EXTENSIONS.has((extension ?? "").toLowerCase())) continue;
+    // Skip the tail of a URL, where the "path" is a host and the "line" a port.
+    const before = text.slice(Math.max(0, (match.index ?? 0) - 12), match.index ?? 0);
+    if (before.includes("://")) continue;
+    void whole;
+    const startLine = Number(start);
+    const endLine = end === undefined ? startLine : Number(end);
+    found.push({
+      file: file as string,
+      startLine,
+      endLine: endLine < startLine ? startLine : endLine,
+    });
+  }
+  return found;
+}
+
+export interface FindingLocation {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+  /** Why this location matters; empty for the finding's own site. */
+  note: string;
+  /** True for the file the finding is filed against. */
+  isPrimary: boolean;
+}
+
+function locationKey(location: { file: string; startLine: number | null }): string {
+  return `${location.file}:${location.startLine ?? ""}`;
+}
+
+/**
+ * Every place a finding points at, in the order to show them: its own site
+ * first, then anything it explicitly referenced, then anything it cited in
+ * prose. Deduplicated, because a finding usually does all three for the same
+ * line.
+ */
+export function findingLocations(finding: {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+  summary?: string;
+  background: string;
+  problem: string;
+  suggestedFix: string;
+  references?: Reference[];
+}): FindingLocation[] {
+  const locations: FindingLocation[] = [
+    {
+      file: finding.file,
+      startLine: finding.startLine,
+      endLine: finding.endLine,
+      note: "",
+      isPrimary: true,
+    },
+  ];
+  for (const reference of finding.references ?? []) {
+    locations.push({ ...reference, isPrimary: false });
+  }
+  const prose = [
+    finding.summary ?? "",
+    finding.background,
+    finding.problem,
+    finding.suggestedFix,
+  ].join("\n");
+  for (const citation of extractCitations(prose)) {
+    locations.push({ ...citation, note: "", isPrimary: false });
+  }
+  const seen = new Set<string>();
+  return locations.filter((location) => {
+    const key = locationKey(location);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Trim prose to a sentence boundary near `limit` characters. */
+function clampSentences(text: string, limit: number): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= limit) return collapsed;
+  const cut = collapsed.slice(0, limit);
+  const boundary = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("; "));
+  return boundary > limit * 0.5 ? cut.slice(0, boundary + 1) : `${cut.trimEnd()}…`;
+}
+
+/**
+ * The gist for the list view. Prefers what the agent wrote, and falls back to
+ * the problem statement so findings recorded before `summary` existed still
+ * read well.
+ */
+export function findingGist(finding: { summary?: string; problem: string }): string {
+  const summary = (finding.summary ?? "").trim();
+  return clampSentences(summary === "" ? finding.problem : summary, 240);
+}
+
+// ---------------------------------------------------------------------------
+// GitHub deep links
+// ---------------------------------------------------------------------------
+
+export function githubPrUrl(repo: string, number: number): string {
+  return `https://github.com/${repo}/pull/${number}`;
+}
+
+/**
+ * A PR's diff, anchored at one file and optionally one line. GitHub anchors
+ * each file by `diff-<sha256 of the repo-relative path>`; the caller supplies
+ * that digest so this stays free of a crypto dependency.
+ */
+export function githubPrFileUrl(args: {
+  repo: string;
+  number: number;
+  pathDigest: string;
+  line?: number | null;
+  side?: "LEFT" | "RIGHT";
+}): string {
+  const suffix =
+    args.line == null ? "" : `${args.side === "LEFT" ? "L" : "R"}${args.line}`;
+  return `${githubPrUrl(args.repo, args.number)}/files#diff-${args.pathDigest}${suffix}`;
 }

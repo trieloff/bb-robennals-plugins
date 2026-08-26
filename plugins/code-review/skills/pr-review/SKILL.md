@@ -51,7 +51,10 @@ comment themselves.
 
 ## Writing good findings
 
-Each finding has five parts, and they are not interchangeable:
+Each finding has these parts, and they are not interchangeable:
+
+- **`summary`** — the gist, in at most two sentences. This is all the reviewer
+  sees in the list, so it has to convey what is wrong on its own.
 
 - **`background`** — what the code does, so a reader who has not been in this
   file can follow the rest. Not a restatement of the problem.
@@ -61,6 +64,12 @@ Each finding has five parts, and they are not interchangeable:
 - **`suggestedComment`** — posted to GitHub verbatim. Write it *to the PR
   author*, not as a note to yourself: no "the user should", no restating what
   you did. Short and specific beats thorough and vague.
+- **`references`** — other places in the repo the finding depends on: the
+  function it contradicts, the existing pattern it diverges from, the test that
+  should have caught it. Each is `{ file, startLine, endLine, note }`, and the
+  panel shows that code next to the finding, so a reference saves the reviewer
+  the lookup. Citing `path/to/file.ts:42` inline in your prose works too — the
+  panel picks those up — but a `references` entry with a `note` is better.
 - **`file` / `startLine` / `endLine`** — where the comment anchors. Use line
   numbers in the **new** file (`side: "RIGHT"`); use `"LEFT"` and old-file line
   numbers only when commenting on a deleted line. A finding with no line

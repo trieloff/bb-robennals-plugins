@@ -1,20 +1,18 @@
 // bb-plugin-code-review — frontend.
 //
-// One nav panel with two views:
+// Three views, one nav panel:
 //   - the PR list, filtered by who was asked to review;
-//   - a PR view with its diff, the review controls, and the findings, each of
-//     which you can edit, post to GitHub, or open a discussion thread about.
+//   - a PR's issue list: one compact row per finding, plus a way into GitHub;
+//   - an issue, with its detail on top and the code it points at below.
 //
-// The discussion thread renders in a fixed panel tab so talking an issue over
-// with an agent does not navigate you away from the findings.
+// The panel remembers the repo and filter server-side, so re-opening the tab
+// resumes where it left off instead of asking again.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   definePluginApp,
-  experimental_Diff as Diff,
   experimental_useAppPanel,
   experimental_useFixedTabTarget,
-  Markdown,
   ThreadChat,
   UrlLink,
   useBbNavigate,
@@ -42,8 +40,30 @@ import { cn } from "@/lib/utils";
 const PANEL_ID = "code-review";
 const PANEL_PATH = "code-review";
 const ANY_TEAM = "__any__";
+/** Context ladder for the snippet "more context" control. */
+const CONTEXT_STEPS = [3, 25, 100] as const;
 
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
+type PrFilter =
+  | { kind: "all" }
+  | { kind: "mine" }
+  | { kind: "my-teams" }
+  | { kind: "team"; teamSlug: string };
+
+/** One place a finding points at, with its code. Mirrors the RPC output. */
+interface LocationDto {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+  note: string;
+  isPrimary: boolean;
+  diffUrl: string;
+  firstLine: number;
+  lines: string[];
+  hasMoreAbove: boolean;
+  hasMoreBelow: boolean;
+  error: string | null;
+}
 
 // ---------------------------------------------------------------------------
 // Routing — the nav panel owns /plugins/code-review/code-review/*
@@ -51,21 +71,33 @@ type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 
 type Route =
   | { kind: "list" }
-  | { kind: "pr"; repo: string; number: number };
+  | { kind: "pr"; repo: string; number: number }
+  | { kind: "finding"; repo: string; number: number; findingId: string };
 
 function parseSubPath(subPath: string): Route {
   const segments = subPath.split("/").filter((segment) => segment !== "");
-  if (segments[0] === "pr" && segments.length === 4) {
+  if (segments[0] === "pr" && segments.length >= 4) {
     const number = Number(segments[3]);
+    const repo = `${segments[1]}/${segments[2]}`;
     if (Number.isInteger(number) && number > 0) {
-      return { kind: "pr", repo: `${segments[1]}/${segments[2]}`, number };
+      if (segments[4] === "f" && segments[5] !== undefined) {
+        return { kind: "finding", repo, number, findingId: segments[5] };
+      }
+      return { kind: "pr", repo, number };
     }
   }
   return { kind: "list" };
 }
 
 function routeToSubPath(route: Route): string {
-  return route.kind === "pr" ? `pr/${route.repo}/${route.number}` : "";
+  switch (route.kind) {
+    case "list":
+      return "";
+    case "pr":
+      return `pr/${route.repo}/${route.number}`;
+    case "finding":
+      return `pr/${route.repo}/${route.number}/f/${route.findingId}`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,12 +147,17 @@ function EmptyState({
   );
 }
 
-function locationLabel(finding: FindingDto): string {
-  if (finding.startLine === null) return finding.file;
-  if (finding.endLine !== null && finding.endLine !== finding.startLine) {
-    return `${finding.file}:${finding.startLine}-${finding.endLine}`;
-  }
-  return `${finding.file}:${finding.startLine}`;
+function locationLabel(target: {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+}): string {
+  if (target.startLine === null) return target.file;
+  const range =
+    target.endLine !== null && target.endLine !== target.startLine
+      ? `${target.startLine}-${target.endLine}`
+      : `${target.startLine}`;
+  return `${target.file}:${range}`;
 }
 
 /** Refetches on mount and on every server "code-review-changed" signal. */
@@ -188,7 +225,7 @@ function DiscussionTab() {
         <EmptyState
           icon="SideChat"
           title="No discussion open"
-          detail={'Press "Discuss" on a finding to talk it over with an agent here.'}
+          detail={'Press "Discuss" on an issue to talk it over with an agent here.'}
         />
       </div>
     );
@@ -211,6 +248,19 @@ function DiscussionTab() {
 // ---------------------------------------------------------------------------
 
 type FilterTab = "mine" | "teams" | "all";
+
+function tabAndTeamFor(filter: PrFilter): { tab: FilterTab; team: string } {
+  switch (filter.kind) {
+    case "all":
+      return { tab: "all", team: ANY_TEAM };
+    case "mine":
+      return { tab: "mine", team: ANY_TEAM };
+    case "my-teams":
+      return { tab: "teams", team: ANY_TEAM };
+    case "team":
+      return { tab: "teams", team: filter.teamSlug };
+  }
+}
 
 function reviewBadge(pr: PullRequestDto): ReactNode {
   switch (pr.reviewStatus) {
@@ -254,7 +304,10 @@ function PrRow({ pr, onOpen }: { pr: PullRequestDto; onOpen: () => void }) {
       <div className="flex items-start gap-2">
         <Icon
           name={pr.isDraft ? "GitPullRequestDraft" : "GitPullRequest"}
-          className={cn("mt-0.5 size-4 shrink-0", pr.isDraft ? "text-muted-foreground" : "text-foreground")}
+          className={cn(
+            "mt-0.5 size-4 shrink-0",
+            pr.isDraft ? "text-muted-foreground" : "text-foreground",
+          )}
         />
         <span className="min-w-0 flex-1 text-sm font-medium leading-snug">{pr.title}</span>
         {reviewBadge(pr)}
@@ -266,7 +319,9 @@ function PrRow({ pr, onOpen }: { pr: PullRequestDto; onOpen: () => void }) {
         <span>·</span>
         <span className="text-foreground/70">+{pr.additions}</span>
         <span className="text-foreground/70">−{pr.deletions}</span>
-        <span>in {pr.changedFiles} file{pr.changedFiles === 1 ? "" : "s"}</span>
+        <span>
+          in {pr.changedFiles} file{pr.changedFiles === 1 ? "" : "s"}
+        </span>
         {requestedTeams.length > 0 ? (
           <>
             <span>·</span>
@@ -282,28 +337,23 @@ function PrListView({
   rpc,
   repo,
   repos,
+  filter,
   onRepoChange,
+  onFilterChange,
   myTeams,
   onOpenPr,
 }: {
   rpc: Rpc;
   repo: string | null;
   repos: string[];
+  filter: PrFilter;
   onRepoChange: (repo: string) => void;
+  onFilterChange: (filter: PrFilter) => void;
   myTeams: string[];
   onOpenPr: (repo: string, number: number) => void;
 }) {
-  const [tab, setTab] = useState<FilterTab>("mine");
-  const [team, setTeam] = useState<string>(ANY_TEAM);
   const [isRefreshing, setIsRefreshing] = useState(false);
-
-  const filter = useMemo(() => {
-    if (tab === "all") return { kind: "all" as const };
-    if (tab === "mine") return { kind: "mine" as const };
-    return team === ANY_TEAM
-      ? { kind: "my-teams" as const }
-      : { kind: "team" as const, teamSlug: team };
-  }, [tab, team]);
+  const { tab, team } = tabAndTeamFor(filter);
 
   const filterKey = JSON.stringify(filter);
   const { data, error, isLoading, refetch } = useLiveQuery(
@@ -338,7 +388,18 @@ function PrListView({
             ))}
           </SelectContent>
         </Select>
-        <Tabs value={tab} onValueChange={(next) => setTab(next as FilterTab)}>
+        <Tabs
+          value={tab}
+          onValueChange={(next) => {
+            if (next === "all") onFilterChange({ kind: "all" });
+            else if (next === "mine") onFilterChange({ kind: "mine" });
+            else {
+              onFilterChange(
+                team === ANY_TEAM ? { kind: "my-teams" } : { kind: "team", teamSlug: team },
+              );
+            }
+          }}
+        >
           <TabsList className="h-8">
             <TabsTrigger value="mine" className="text-xs">
               Asked me
@@ -352,7 +413,14 @@ function PrListView({
           </TabsList>
         </Tabs>
         {tab === "teams" ? (
-          <Select value={team} onValueChange={setTeam}>
+          <Select
+            value={team}
+            onValueChange={(next) =>
+              onFilterChange(
+                next === ANY_TEAM ? { kind: "my-teams" } : { kind: "team", teamSlug: next },
+              )
+            }
+          >
             <SelectTrigger className="h-8 w-[15rem] text-xs">
               <SelectValue />
             </SelectTrigger>
@@ -386,8 +454,8 @@ function PrListView({
       {tab === "teams" && myTeams.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           No teams found. `gh api /user/teams` needs the `read:org` scope — run{" "}
-          <code className="font-mono">gh auth refresh -s read:org</code>, or list your teams
-          in the plugin&apos;s Teams setting.
+          <code className="font-mono">gh auth refresh -s read:org</code>, or list your teams in
+          the plugin&apos;s Teams setting.
         </p>
       ) : null}
 
@@ -420,11 +488,7 @@ function PrListView({
       ) : (
         <div className="flex flex-col gap-2">
           {data.pullRequests.map((pr) => (
-            <PrRow
-              key={pr.number}
-              pr={pr}
-              onOpen={() => onOpenPr(pr.repo, pr.number)}
-            />
+            <PrRow key={pr.number} pr={pr} onOpen={() => onOpenPr(pr.repo, pr.number)} />
           ))}
         </div>
       )}
@@ -433,10 +497,315 @@ function PrListView({
 }
 
 // ---------------------------------------------------------------------------
-// A finding
+// A PR's issue list
 // ---------------------------------------------------------------------------
 
-function FindingCard({
+function FindingRow({ finding, onOpen }: { finding: FindingDto; onOpen: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={cn(
+        "flex w-full flex-col gap-1 rounded-lg border border-border bg-card px-3 py-2.5 text-left transition-colors hover:bg-accent/50",
+        finding.state === "dismissed" && "opacity-55",
+      )}
+    >
+      <div className="flex items-start gap-2">
+        <SeverityBadge severity={finding.severity} />
+        <span className="min-w-0 flex-1 text-sm font-medium leading-snug">{finding.title}</span>
+        {finding.state === "posted" ? (
+          <Badge variant="outline" className="shrink-0 gap-1 border-border">
+            <Icon name="Check" className="size-3" />
+            posted
+          </Badge>
+        ) : null}
+        <Icon name="ChevronRight" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+      </div>
+      {/* The gist, clamped to three lines — the point of this row. */}
+      <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground">{finding.gist}</p>
+      <p className="font-mono text-[11px] text-muted-foreground/80">{locationLabel(finding)}</p>
+    </button>
+  );
+}
+
+function ReviewControls({
+  rpc,
+  repo,
+  number,
+  review,
+  skills,
+}: {
+  rpc: Rpc;
+  repo: string;
+  number: number;
+  review: ReviewDto | null;
+  skills: string[];
+}) {
+  const navigate = useBbNavigate();
+  const [isStarting, setIsStarting] = useState(false);
+  const isRunning = review !== null && (review.status === "running" || review.status === "queued");
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          size="sm"
+          className="h-8 gap-1.5 text-xs"
+          disabled={isStarting || isRunning}
+          onClick={() => {
+            setIsStarting(true);
+            rpc
+              .call("startReview", { repo, number })
+              .then(() => toast.success("Review started"), reportError)
+              .finally(() => setIsStarting(false));
+          }}
+        >
+          <Icon
+            name={isRunning ? "Spinner" : "Bot"}
+            className={cn("size-3.5", isRunning && "animate-spin")}
+          />
+          {isRunning ? "Reviewing…" : review === null ? "Review this PR" : "Re-run review"}
+        </Button>
+        {review?.threadId != null ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 gap-1.5 text-xs"
+            onClick={() => navigate.toThread(review.threadId as string)}
+          >
+            <Icon name="MessageSquare" className="size-3.5" />
+            Review thread
+          </Button>
+        ) : null}
+        <span className="text-xs text-muted-foreground">
+          {skills.length === 0 ? "Generic review" : `Skills: ${skills.join(", ")}`}
+        </span>
+      </div>
+      {review?.error != null ? <p className="text-xs text-destructive">{review.error}</p> : null}
+    </div>
+  );
+}
+
+function PrFindingsView({
+  rpc,
+  repo,
+  number,
+  skills,
+  onBack,
+  onOpenFinding,
+}: {
+  rpc: Rpc;
+  repo: string;
+  number: number;
+  skills: string[];
+  onBack: () => void;
+  onOpenFinding: (findingId: string) => void;
+}) {
+  const { data, error, isLoading } = useLiveQuery(
+    () => rpc.call("getPullRequest", { repo, number }),
+    [rpc, repo, number],
+  );
+
+  const grouped = useMemo(() => {
+    const findings = data?.findings ?? [];
+    return {
+      open: findings.filter((finding) => finding.state === "open"),
+      posted: findings.filter((finding) => finding.state === "posted"),
+      dismissed: findings.filter((finding) => finding.state === "dismissed"),
+    };
+  }, [data]);
+
+  if (error !== null) {
+    return (
+      <div className="flex flex-col gap-3">
+        <BackButton onBack={onBack} label="All pull requests" />
+        <EmptyState icon="AlertTriangle" title="Could not load this pull request" detail={error} />
+      </div>
+    );
+  }
+  if (isLoading && data === null) {
+    return (
+      <div className="flex flex-col gap-3">
+        <BackButton onBack={onBack} label="All pull requests" />
+        <Skeleton className="h-20 w-full rounded-lg" />
+        <Skeleton className="h-32 w-full rounded-lg" />
+      </div>
+    );
+  }
+  const pr = data?.pullRequest ?? null;
+  const isEmpty =
+    grouped.open.length === 0 && grouped.posted.length === 0 && grouped.dismissed.length === 0;
+
+  const section = (title: string, findings: FindingDto[]) =>
+    findings.length === 0 ? null : (
+      <Section key={title} title={`${title} (${findings.length})`}>
+        <div className="flex flex-col gap-2">
+          {findings.map((finding) => (
+            <FindingRow
+              key={finding.id}
+              finding={finding}
+              onOpen={() => onOpenFinding(finding.id)}
+            />
+          ))}
+        </div>
+      </Section>
+    );
+
+  return (
+    <div className="flex flex-col gap-4">
+      <BackButton onBack={onBack} label="All pull requests" />
+
+      <div className="flex flex-col gap-1">
+        <div className="flex items-start gap-2">
+          <Icon name="GitPullRequest" className="mt-1 size-4 shrink-0" />
+          <h2 className="min-w-0 flex-1 text-base font-semibold leading-snug">
+            {pr?.title ?? `Pull request #${number}`}
+          </h2>
+          {pr === null ? null : (
+            <UrlLink
+              href={pr.url}
+              className="mt-0.5 inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs transition-colors hover:bg-accent"
+            >
+              <Icon name="Github" className="size-3.5" />
+              Open on GitHub
+            </UrlLink>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-xs text-muted-foreground">
+          <span>
+            {repo}#{number}
+          </span>
+          {pr === null ? null : (
+            <>
+              <span>·</span>
+              <span>{pr.author}</span>
+              <span>·</span>
+              <span>
+                {pr.headRefName} → {pr.baseRefName}
+              </span>
+              <span>·</span>
+              <span className="text-foreground/70">+{pr.additions}</span>
+              <span className="text-foreground/70">−{pr.deletions}</span>
+              <span>
+                in {pr.changedFiles} file{pr.changedFiles === 1 ? "" : "s"}
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+
+      <ReviewControls
+        rpc={rpc}
+        repo={repo}
+        number={number}
+        review={data?.review ?? null}
+        skills={data?.review?.skills ?? skills}
+      />
+
+      {isEmpty ? (
+        <EmptyState
+          icon="Bug"
+          title={
+            data?.review == null
+              ? "No review yet"
+              : data.review.status === "reported"
+                ? "No issues found"
+                : "Review in progress"
+          }
+          detail={
+            data?.review == null
+              ? 'Press "Review this PR" to run your review skills against this change.'
+              : data.review.status === "reported"
+                ? "The review finished without raising anything."
+                : "The review thread is working. Issues appear here as soon as it submits them."
+          }
+        />
+      ) : (
+        <>
+          {section("Issues", grouped.open)}
+          {section("Posted", grouped.posted)}
+          {section("Dismissed", grouped.dismissed)}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// One issue, with the code it points at
+// ---------------------------------------------------------------------------
+
+/**
+ * A snippet with real file line numbers. BB's SourceCode component numbers an
+ * excerpt from 1, which would misreport every line — and these line numbers
+ * are exactly what the reviewer is checking against the finding.
+ */
+function CodeSnippet({ location }: { location: LocationDto }) {
+  const from = location.startLine;
+  const to = location.endLine ?? location.startLine;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full border-collapse font-mono text-xs">
+        <tbody>
+          {location.lines.map((line, index) => {
+            const lineNumber = location.firstLine + index;
+            const isCited = from !== null && lineNumber >= from && lineNumber <= (to ?? from);
+            return (
+              <tr key={lineNumber} className={cn(isCited && "bg-accent/60")}>
+                <td className="w-[1%] select-none whitespace-nowrap border-r border-border px-2 py-px text-right align-top text-muted-foreground/70">
+                  {lineNumber}
+                </td>
+                <td className="whitespace-pre px-3 py-px">{line === "" ? " " : line}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function LocationCard({ location }: { location: LocationDto }) {
+  return (
+    <div className="overflow-hidden rounded-lg border border-border">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/30 px-3 py-1.5">
+        <UrlLink
+          href={location.diffUrl}
+          className="min-w-0 flex-1 truncate font-mono text-xs underline-offset-4 hover:underline"
+          title={`Open ${location.file} in the pull request diff on GitHub`}
+        >
+          {locationLabel(location)}
+        </UrlLink>
+        {location.isPrimary ? (
+          <Badge variant="outline" className="shrink-0 border-border text-[10px]">
+            this issue
+          </Badge>
+        ) : null}
+        <UrlLink
+          href={location.diffUrl}
+          className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline-offset-4 hover:underline"
+        >
+          <Icon name="Github" className="size-3.5" />
+          diff
+        </UrlLink>
+      </div>
+      {location.note === "" ? null : (
+        <p className="border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+          {location.note}
+        </p>
+      )}
+      {location.error !== null ? (
+        <p className="px-3 py-2 text-xs text-muted-foreground">{location.error}</p>
+      ) : location.lines.length === 0 ? (
+        <p className="px-3 py-2 text-xs text-muted-foreground">No lines to show.</p>
+      ) : (
+        <CodeSnippet location={location} />
+      )}
+    </div>
+  );
+}
+
+function FindingActions({
   rpc,
   finding,
   onDiscuss,
@@ -449,8 +818,8 @@ function FindingCard({
   const [comment, setComment] = useState(stored);
   const [isBusy, setIsBusy] = useState(false);
   const [inlineFailed, setInlineFailed] = useState(false);
-  // Adopt server-side changes (a re-run, another window) without clobbering
-  // an edit in progress: the stored value is the identity of the draft.
+  // Adopt server-side changes (a re-run, another window) without clobbering an
+  // edit in progress: the stored value is the identity of the draft.
   const lastStored = useRef(stored);
   useEffect(() => {
     if (lastStored.current !== stored) {
@@ -462,11 +831,13 @@ function FindingCard({
   const isDirty = comment !== stored;
   const isPosted = finding.state === "posted";
 
-  const save = useCallback(() => {
-    return rpc
-      .call("setFindingComment", { findingId: finding.id, comment })
-      .then(() => undefined, reportError);
-  }, [rpc, finding.id, comment]);
+  const save = useCallback(
+    () =>
+      rpc
+        .call("setFindingComment", { findingId: finding.id, comment })
+        .then(() => undefined, reportError),
+    [rpc, finding.id, comment],
+  );
 
   const post = useCallback(
     async (mode: "inline" | "issue") => {
@@ -487,67 +858,33 @@ function FindingCard({
   );
 
   return (
-    <div
-      className={cn(
-        "flex flex-col gap-3 rounded-lg border border-border bg-card p-3",
-        finding.state === "dismissed" && "opacity-55",
-      )}
-    >
-      <div className="flex items-start gap-2">
-        <SeverityBadge severity={finding.severity} />
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium leading-snug">{finding.title}</p>
-          <p className="mt-0.5 font-mono text-xs text-muted-foreground">
-            {locationLabel(finding)}
-            {finding.category === "" ? "" : ` · ${finding.category}`}
-          </p>
-        </div>
-        {isPosted ? (
-          <Badge variant="outline" className="shrink-0 gap-1 border-border">
-            <Icon name="Check" className="size-3" />
-            posted
-          </Badge>
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Comment to post
+        </p>
+        {isDirty && !isPosted ? (
+          <span className="text-xs text-muted-foreground">unsaved edit</span>
+        ) : finding.draftComment !== null ? (
+          <span className="text-xs text-muted-foreground">edited</span>
         ) : null}
       </div>
-
-      <div className="flex flex-col gap-2 text-sm">
-        {finding.background === "" ? null : (
-          <Field label="Background" value={finding.background} />
-        )}
-        <Field label="Problem" value={finding.problem} />
-        {finding.suggestedFix === "" ? null : (
-          <Field label="Suggested fix" value={finding.suggestedFix} />
-        )}
-      </div>
-
-      <div className="flex flex-col gap-2">
-        <div className="flex items-center justify-between">
-          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-            Comment to post
-          </p>
-          {isDirty && !isPosted ? (
-            <span className="text-xs text-muted-foreground">unsaved edit</span>
-          ) : finding.draftComment !== null ? (
-            <span className="text-xs text-muted-foreground">edited</span>
-          ) : null}
+      {isPosted ? (
+        <div className="whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-2 text-sm">
+          {comment}
         </div>
-        {isPosted ? (
-          <div className="rounded-md border border-border bg-muted/30 p-2 text-sm whitespace-pre-wrap">
-            {comment}
-          </div>
-        ) : (
-          <Textarea
-            value={comment}
-            onChange={(event) => setComment(event.target.value)}
-            onBlur={() => {
-              if (isDirty) void save();
-            }}
-            rows={Math.min(12, Math.max(3, comment.split("\n").length + 1))}
-            className="text-sm"
-            aria-label={`Comment for ${finding.title}`}
-          />
-        )}
-      </div>
+      ) : (
+        <Textarea
+          value={comment}
+          onChange={(event) => setComment(event.target.value)}
+          onBlur={() => {
+            if (isDirty) void save();
+          }}
+          rows={Math.min(12, Math.max(3, comment.split("\n").length + 1))}
+          className="text-sm"
+          aria-label={`Comment for ${finding.title}`}
+        />
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         {isPosted ? (
@@ -624,106 +961,41 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// The PR view
-// ---------------------------------------------------------------------------
-
-function ReviewControls({
+function FindingDetailView({
   rpc,
   repo,
   number,
-  review,
-  skills,
-}: {
-  rpc: Rpc;
-  repo: string;
-  number: number;
-  review: ReviewDto | null;
-  skills: string[];
-}) {
-  const navigate = useBbNavigate();
-  const [isStarting, setIsStarting] = useState(false);
-  const isRunning = review !== null && (review.status === "running" || review.status === "queued");
-
-  const start = useCallback(() => {
-    setIsStarting(true);
-    rpc
-      .call("startReview", { repo, number })
-      .then(() => toast.success("Review started"), reportError)
-      .finally(() => setIsStarting(false));
-  }, [rpc, repo, number]);
-
-  return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          className="h-8 gap-1.5 text-xs"
-          disabled={isStarting || isRunning}
-          onClick={start}
-        >
-          <Icon
-            name={isRunning ? "Spinner" : "Bot"}
-            className={cn("size-3.5", isRunning && "animate-spin")}
-          />
-          {isRunning ? "Reviewing…" : review === null ? "Review this PR" : "Re-run review"}
-        </Button>
-        {review?.threadId != null ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-8 gap-1.5 text-xs"
-            onClick={() => navigate.toThread(review.threadId as string)}
-          >
-            <Icon name="MessageSquare" className="size-3.5" />
-            Open review thread
-          </Button>
-        ) : null}
-        <span className="text-xs text-muted-foreground">
-          {skills.length === 0
-            ? "Generic review — set review skills in plugin settings"
-            : `Skills: ${skills.join(", ")}`}
-        </span>
-      </div>
-      {review?.error != null ? (
-        <p className="text-xs text-destructive">{review.error}</p>
-      ) : null}
-      {review !== null && review.summary !== "" ? (
-        <div className="border-t border-border pt-2 text-sm">
-          <Markdown content={review.summary} />
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function PrDetailView({
-  rpc,
-  repo,
-  number,
-  skills,
+  findingId,
   onBack,
 }: {
   rpc: Rpc;
   repo: string;
   number: number;
-  skills: string[];
+  findingId: string;
   onBack: () => void;
 }) {
   const panel = experimental_useAppPanel();
-  const [showDiff, setShowDiff] = useState(false);
-  const { data, error, isLoading } = useLiveQuery(
-    () => rpc.call("getPullRequest", { repo, number }),
-    [rpc, repo, number],
+  const [contextStep, setContextStep] = useState(0);
+  const context = CONTEXT_STEPS[contextStep] ?? CONTEXT_STEPS[0];
+
+  const pr = useLiveQuery(() => rpc.call("getPullRequest", { repo, number }), [rpc, repo, number]);
+  const code = useLiveQuery(
+    () => rpc.call("getFindingCode", { findingId, context }),
+    [rpc, findingId, context],
+  );
+
+  const finding = useMemo(
+    () => (pr.data?.findings ?? []).find((entry) => entry.id === findingId) ?? null,
+    [pr.data, findingId],
   );
 
   const discuss = useCallback(
-    (finding: FindingDto) => {
-      rpc.call("discussFinding", { findingId: finding.id }).then((result) => {
+    (target: FindingDto) => {
+      rpc.call("discussFinding", { findingId: target.id }).then((result) => {
         const opened = panel.openFixedTab({
           surface: { kind: "current" },
           tab: discussionTabRef,
-          target: { threadId: result.threadId, title: finding.title },
+          target: { threadId: result.threadId, title: target.title },
         });
         if (!opened) toast.error("Could not open the discussion tab.");
       }, reportError);
@@ -731,158 +1003,93 @@ function PrDetailView({
     [rpc, panel],
   );
 
-  const grouped = useMemo(() => {
-    const findings = data?.findings ?? [];
-    return {
-      open: findings.filter((finding) => finding.state === "open"),
-      posted: findings.filter((finding) => finding.state === "posted"),
-      dismissed: findings.filter((finding) => finding.state === "dismissed"),
-    };
-  }, [data]);
-
-  if (error !== null) {
+  if (pr.isLoading && pr.data === null) {
     return (
       <div className="flex flex-col gap-3">
-        <BackButton onBack={onBack} />
-        <EmptyState icon="AlertTriangle" title="Could not load this pull request" detail={error} />
-      </div>
-    );
-  }
-  if (isLoading && data === null) {
-    return (
-      <div className="flex flex-col gap-3">
-        <BackButton onBack={onBack} />
-        <Skeleton className="h-24 w-full rounded-lg" />
+        <BackButton onBack={onBack} label="All issues" />
         <Skeleton className="h-40 w-full rounded-lg" />
       </div>
     );
   }
-  const pr = data?.pullRequest ?? null;
+  if (finding === null) {
+    return (
+      <div className="flex flex-col gap-3">
+        <BackButton onBack={onBack} label="All issues" />
+        <EmptyState
+          icon="Bug"
+          title="This issue is gone"
+          detail="It was probably replaced by a re-run of the review."
+        />
+      </div>
+    );
+  }
+
+  const locations: LocationDto[] = code.data?.locations ?? [];
+  const nextContext = CONTEXT_STEPS[contextStep + 1];
 
   return (
     <div className="flex flex-col gap-4">
-      <BackButton onBack={onBack} />
+      <BackButton onBack={onBack} label="All issues" />
 
-      <div className="flex flex-col gap-1">
+      <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-3">
         <div className="flex items-start gap-2">
-          <Icon name="GitPullRequest" className="mt-1 size-4 shrink-0" />
-          <h2 className="text-base font-semibold leading-snug">
-            {pr?.title ?? `Pull request #${number}`}
-          </h2>
+          <SeverityBadge severity={finding.severity} />
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-semibold leading-snug">{finding.title}</h2>
+            <p className="mt-0.5 font-mono text-xs text-muted-foreground">
+              {locationLabel(finding)}
+              {finding.category === "" ? "" : ` · ${finding.category}`}
+            </p>
+          </div>
+          {finding.state === "posted" ? (
+            <Badge variant="outline" className="shrink-0 gap-1 border-border">
+              <Icon name="Check" className="size-3" />
+              posted
+            </Badge>
+          ) : null}
         </div>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-xs text-muted-foreground">
-          <span>
-            {repo}#{number}
-          </span>
-          {pr === null ? null : (
-            <>
-              <span>·</span>
-              <span>{pr.author}</span>
-              <span>·</span>
-              <span>
-                {pr.headRefName} → {pr.baseRefName}
-              </span>
-              <span>·</span>
-              <UrlLink
-                href={pr.url}
-                className="inline-flex items-center gap-1 underline-offset-4 hover:underline"
-              >
-                <Icon name="ExternalLink" className="size-3" />
-                GitHub
-              </UrlLink>
-            </>
+
+        <div className="flex flex-col gap-2">
+          {finding.background === "" ? null : (
+            <Field label="Background" value={finding.background} />
+          )}
+          <Field label="Problem" value={finding.problem} />
+          {finding.suggestedFix === "" ? null : (
+            <Field label="Suggested fix" value={finding.suggestedFix} />
           )}
         </div>
+
+        <FindingActions rpc={rpc} finding={finding} onDiscuss={discuss} />
       </div>
 
-      <ReviewControls
-        rpc={rpc}
-        repo={repo}
-        number={number}
-        review={data?.review ?? null}
-        skills={data?.review?.skills ?? skills}
-      />
-
-      <Section title={`Findings${grouped.open.length > 0 ? ` (${grouped.open.length})` : ""}`}>
-        {grouped.open.length === 0 ? (
-          <EmptyState
-            icon="Bug"
-            title={
-              data?.review == null
-                ? "No review yet"
-                : data.review.status === "reported"
-                  ? "No open findings"
-                  : "Review in progress"
-            }
-            detail={
-              data?.review == null
-                ? 'Press "Review this PR" to run your review skills against this change.'
-                : data.review.status === "reported"
-                  ? "The review finished without raising anything still open."
-                  : "The review thread is working. Findings appear here as soon as it submits them."
-            }
-          />
-        ) : (
-          <div className="flex flex-col gap-3">
-            {grouped.open.map((finding) => (
-              <FindingCard key={finding.id} rpc={rpc} finding={finding} onDiscuss={discuss} />
-            ))}
-          </div>
-        )}
-      </Section>
-
-      {grouped.posted.length > 0 ? (
-        <Section title={`Posted (${grouped.posted.length})`}>
-          <div className="flex flex-col gap-3">
-            {grouped.posted.map((finding) => (
-              <FindingCard key={finding.id} rpc={rpc} finding={finding} onDiscuss={discuss} />
-            ))}
-          </div>
-        </Section>
-      ) : null}
-
-      {grouped.dismissed.length > 0 ? (
-        <Section title={`Dismissed (${grouped.dismissed.length})`}>
-          <div className="flex flex-col gap-3">
-            {grouped.dismissed.map((finding) => (
-              <FindingCard key={finding.id} rpc={rpc} finding={finding} onDiscuss={discuss} />
-            ))}
-          </div>
-        </Section>
-      ) : null}
-
-      {data !== null && data.body !== "" ? (
-        <Section title="Description">
-          <div className="rounded-lg border border-border bg-card p-3">
-            <Markdown content={data.body} />
-          </div>
-        </Section>
-      ) : null}
-
       <Section
-        title={`Diff${data === null ? "" : ` (${data.files.length} file${data.files.length === 1 ? "" : "s"})`}`}
+        title={`Code${locations.length > 0 ? ` (${locations.length})` : ""}`}
         action={
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 text-xs"
-            onClick={() => setShowDiff((current) => !current)}
-          >
-            {showDiff ? "Hide" : "Show"}
-          </Button>
+          locations.length === 0 ? null : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => setContextStep((step) => (step + 1) % CONTEXT_STEPS.length)}
+            >
+              {nextContext === undefined ? "Less context" : `More context (±${nextContext})`}
+            </Button>
+          )
         }
       >
-        {data?.diffError != null ? (
-          <p className="text-xs text-destructive">{data.diffError}</p>
-        ) : !showDiff ? null : (
+        {code.error !== null ? (
+          <EmptyState icon="AlertTriangle" title="Could not load the code" detail={code.error} />
+        ) : code.isLoading && code.data === null ? (
+          <Skeleton className="h-40 w-full rounded-lg" />
+        ) : locations.length === 0 ? (
+          <EmptyState icon="Code" title="No code to show" detail="This issue cites no file." />
+        ) : (
           <div className="flex flex-col gap-3">
-            {(data?.files ?? []).map((file) => (
-              <div key={file.path} className="overflow-hidden rounded-lg border border-border">
-                <p className="border-b border-border bg-muted/30 px-3 py-1.5 font-mono text-xs">
-                  {file.path}
-                </p>
-                <Diff patch={file.patch} path={file.path} />
-              </div>
+            {locations.map((location) => (
+              <LocationCard
+                key={`${location.file}:${location.startLine ?? ""}`}
+                location={location}
+              />
             ))}
           </div>
         )}
@@ -891,11 +1098,11 @@ function PrDetailView({
   );
 }
 
-function BackButton({ onBack }: { onBack: () => void }) {
+function BackButton({ onBack, label }: { onBack: () => void; label: string }) {
   return (
     <Button variant="ghost" size="sm" className="h-7 w-fit gap-1 px-1.5 text-xs" onClick={onBack}>
       <Icon name="ChevronLeft" className="size-3.5" />
-      All pull requests
+      {label}
     </Button>
   );
 }
@@ -930,22 +1137,52 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const route = useMemo(() => parseSubPath(subPath), [subPath]);
-  const [repo, setRepo] = useState<string | null>(null);
 
   const status = useLiveQuery(() => rpc.call("status"), [rpc]);
-  const repos = status.data?.repos ?? [];
+  const repos = useMemo(() => status.data?.repos ?? [], [status.data]);
 
-  // Default to the first known repo, and follow whichever repo the open PR
-  // belongs to so going back lands on the right list.
+  // Repo and filter live on the server, so re-opening the tab resumes instead
+  // of asking again.
+  const [repo, setRepo] = useState<string | null>(null);
+  const [filter, setFilter] = useState<PrFilter>({ kind: "mine" });
+  const [isRestored, setIsRestored] = useState(false);
+
   useEffect(() => {
-    if (route.kind === "pr") {
-      setRepo(route.repo);
-      return;
-    }
+    let cancelled = false;
+    const done = () => {
+      if (!cancelled) setIsRestored(true);
+    };
+    rpc.call("getPanelState").then((state) => {
+      if (cancelled) return;
+      if (state.repo !== null) setRepo(state.repo);
+      if (state.filter !== null) setFilter(state.filter as PrFilter);
+      done();
+    }, done);
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc]);
+
+  // Only fall back to the first known repo once the saved one has had its say.
+  useEffect(() => {
+    if (!isRestored) return;
     setRepo((current) =>
       current !== null && repos.includes(current) ? current : (repos[0] ?? null),
     );
-  }, [route, repos]);
+  }, [isRestored, repos]);
+
+  const persist = useCallback(
+    (next: { repo?: string; filter?: PrFilter }) => {
+      rpc
+        .call("setPanelState", {
+          repo: next.repo ?? repo,
+          filter: next.filter ?? filter,
+        })
+        // Losing the saved position is not worth interrupting the user for.
+        .catch(() => undefined);
+    },
+    [rpc, repo, filter],
+  );
 
   const go = useCallback(
     (next: Route) => navigate.toPluginPanel(PANEL_PATH, { subPath: routeToSubPath(next) }),
@@ -976,20 +1213,39 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
               </>
             }
           />
+        ) : route.kind === "finding" ? (
+          <FindingDetailView
+            rpc={rpc}
+            repo={route.repo}
+            number={route.number}
+            findingId={route.findingId}
+            onBack={() => go({ kind: "pr", repo: route.repo, number: route.number })}
+          />
         ) : route.kind === "pr" ? (
-          <PrDetailView
+          <PrFindingsView
             rpc={rpc}
             repo={route.repo}
             number={route.number}
             skills={status.data?.skills ?? []}
             onBack={() => go({ kind: "list" })}
+            onOpenFinding={(findingId) =>
+              go({ kind: "finding", repo: route.repo, number: route.number, findingId })
+            }
           />
         ) : (
           <PrListView
             rpc={rpc}
             repo={repo}
             repos={repos}
-            onRepoChange={setRepo}
+            filter={filter}
+            onRepoChange={(next) => {
+              setRepo(next);
+              persist({ repo: next });
+            }}
+            onFilterChange={(next) => {
+              setFilter(next);
+              persist({ filter: next });
+            }}
             myTeams={status.data?.myTeams ?? []}
             onOpenPr={(nextRepo, number) => go({ kind: "pr", repo: nextRepo, number })}
           />

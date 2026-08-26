@@ -11,12 +11,19 @@ yourself — one comment at a time, edited how you want it.
 2. **Review it.** Press *Review this PR*. A BB thread runs the review skills you
    configured against the change and writes structured findings to a JSON file,
    then submits them with `bb code-review submit`.
-3. **Act on each finding.** Every finding arrives with the background, the
-   problem, a suggested fix, and a ready-to-post comment. For each one you can
-   **post it to GitHub verbatim**, **edit the comment first**, **discuss it with
-   an agent** in a side tab, or **dismiss it**.
+3. **Skim the issues.** The review screen is a plain list: severity, title, and
+   a three-line gist. Nothing else, plus one button through to the PR on GitHub.
+4. **Open an issue** for the detail — background, problem, suggested fix — and
+   below it, every file the issue points at, stacked, each showing just the
+   cited lines with their real line numbers. That includes files the finding
+   only mentioned in passing: `src/thing.ts:42` in its prose becomes a snippet.
+   Any file header links to that file's place in the PR diff on GitHub.
+5. **Act on it**: **post the comment verbatim**, **edit it first**, **discuss it
+   with an agent** in a side tab, or **dismiss it**.
 
-Nothing reaches GitHub until you press *Post comment*. The review agent is told
+The panel remembers the repo and filter you were on, so re-opening the tab
+resumes where you left off. Nothing reaches GitHub until you press
+*Post comment*. The review agent is told
 in as many words not to post, approve, request changes, or touch the PR.
 
 ## Setup
