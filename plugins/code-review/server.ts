@@ -30,6 +30,8 @@ import {
   formatFileList,
   githubPrFileUrl,
   githubPrUrl,
+  needsPathResolution,
+  resolveCitedPath,
   filterPullRequests,
   isRepoName,
   parseGithubRemote,
@@ -242,6 +244,9 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({
       prUrl: z.string(),
+      headSha: z.string(),
+      /** False when the code was fetched after the review, so lines may have moved. */
+      isReviewedCommit: z.boolean(),
       locations: z.array(codeLocationSchema),
     }),
   },
@@ -564,6 +569,14 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        prs TEXT NOT NULL,
        fetched_at TEXT NOT NULL
      )`,
+    `ALTER TABLE review_context ADD COLUMN at_review_start INTEGER NOT NULL DEFAULT 1`,
+    // The repo's file list at the reviewed commit, so a citation to code the
+    // PR does not touch can still be resolved to a real path.
+    `CREATE TABLE IF NOT EXISTS repo_tree (
+       review_id TEXT PRIMARY KEY,
+       paths TEXT NOT NULL,
+       fetched_at TEXT NOT NULL
+     )`,
   ]);
 
   function getReview(reviewId: string): ReviewRow | null {
@@ -838,14 +851,21 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     snapshot: string;
     diff: string;
     fetched_at: string;
+    at_review_start: number;
   }
 
-  function getContext(reviewId: string): { snapshot: PrSnapshot; diff: string } | null {
+  function getContext(
+    reviewId: string,
+  ): { snapshot: PrSnapshot; diff: string; atReviewStart: boolean } | null {
     const row = db.prepare(`SELECT * FROM review_context WHERE review_id = ?`).get(reviewId) as
       | ContextRow
       | undefined;
     if (row === undefined) return null;
-    return { snapshot: JSON.parse(row.snapshot) as PrSnapshot, diff: row.diff };
+    return {
+      snapshot: JSON.parse(row.snapshot) as PrSnapshot,
+      diff: row.diff,
+      atReviewStart: row.at_review_start !== 0,
+    };
   }
 
   /**
@@ -853,7 +873,11 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
    * agent needs comes from here, so the agent never runs gh: gh is configured
    * and unsandboxed here, and may be neither in the agent's environment.
    */
-  async function fetchContext(repo: string, number: number): Promise<PrSnapshot> {
+  async function fetchContext(
+    repo: string,
+    number: number,
+    atReviewStart = true,
+  ): Promise<PrSnapshot> {
     const [viewRaw, diffRaw] = await Promise.all([
       gh(["pr", "view", String(number), "-R", repo, "--json", PR_VIEW_JSON_FIELDS], 45_000),
       gh(["pr", "diff", String(number), "-R", repo], 120_000),
@@ -869,15 +893,17 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       bb.log.warn(`could not fetch review comments for ${repo}#${number}: ${String(error)}`);
     }
     db.prepare(
-      `INSERT INTO review_context (review_id, snapshot, diff, fetched_at)
-       VALUES (@review_id, @snapshot, @diff, @fetched_at)
+      `INSERT INTO review_context (review_id, snapshot, diff, fetched_at, at_review_start)
+       VALUES (@review_id, @snapshot, @diff, @fetched_at, @at_review_start)
        ON CONFLICT(review_id) DO UPDATE SET
-         snapshot = @snapshot, diff = @diff, fetched_at = @fetched_at`,
+         snapshot = @snapshot, diff = @diff, fetched_at = @fetched_at,
+         at_review_start = @at_review_start`,
     ).run({
       review_id: reviewIdFor(repo, number),
       snapshot: JSON.stringify(snapshot),
       diff: diffRaw,
       fetched_at: nowIso(),
+      at_review_start: atReviewStart ? 1 : 0,
     });
     return snapshot;
   }
@@ -1199,7 +1225,10 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     } catch (cause) {
       // A cited file may simply not exist at that commit — the agent may have
       // named it loosely. That is a per-file note, not a failed request.
-      error = cause instanceof Error ? cause.message : String(cause);
+      const message = cause instanceof Error ? cause.message : String(cause);
+      error = /404|not found/i.test(message)
+        ? `${filePath} is not in the repository at ${sha.slice(0, 12)}.`
+        : message;
     }
     db.prepare(
       `INSERT INTO review_files (review_id, path, content, error, fetched_at)
@@ -1210,17 +1239,79 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     return { content, error };
   }
 
+  /**
+   * Every path in the repo at the reviewed commit, cached per review. Fetched
+   * only when a citation fails to resolve against the PR's own files, which is
+   * the uncommon case.
+   */
+  async function repoTree(reviewId: string, repo: string, sha: string): Promise<string[]> {
+    const cached = db.prepare(`SELECT paths FROM repo_tree WHERE review_id = ?`).get(reviewId) as
+      | { paths: string }
+      | undefined;
+    if (cached !== undefined) return parseJsonArray<string>(cached.paths);
+    let paths: string[] = [];
+    try {
+      const raw = await gh(
+        [
+          "api",
+          `repos/${repo}/git/trees/${sha}?recursive=1`,
+          "--jq",
+          '[.tree[] | select(.type=="blob") | .path] | join("\n")',
+        ],
+        45_000,
+      );
+      paths = raw.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+    } catch (error) {
+      // Resolution is a convenience; without it a citation just stays as
+      // written and reports that it is not in the repo.
+      bb.log.warn(`could not read the tree of ${repo}@${sha.slice(0, 12)}: ${String(error)}`);
+    }
+    db.prepare(
+      `INSERT INTO repo_tree (review_id, paths, fetched_at) VALUES (?, ?, ?)
+       ON CONFLICT(review_id) DO UPDATE SET paths = excluded.paths, fetched_at = excluded.fetched_at`,
+    ).run(reviewId, JSON.stringify(paths), nowIso());
+    return paths;
+  }
+
   function pathDigest(filePath: string): string {
     return createHash("sha256").update(filePath).digest("hex");
   }
 
-  async function findingCode(findingId: string, context: number) {
+  async function findingCode(findingId: string, contextLines: number) {
     const row = requireFinding(findingId);
     const finding = toFindingDto(row);
     const review = getReview(finding.reviewId);
     if (review === null) throw new Error(`No review for finding ${findingId}.`);
-    const snapshot = getContext(finding.reviewId)?.snapshot ?? null;
+    // A review from before snapshots existed, or one whose fetch failed, has
+    // no stored commit. Fetching it is two gh calls — far cheaper than telling
+    // the user to re-run an agent review just to look at code.
+    let stored = getContext(finding.reviewId);
+    if (stored === null || stored.snapshot.headSha === "") {
+      await fetchContext(review.repo, review.number, false);
+      stored = getContext(finding.reviewId);
+    }
+    const snapshot = stored?.snapshot ?? null;
     const sha = snapshot?.headSha ?? "";
+
+    const prPaths = (snapshot?.files ?? []).map((entry) => entry.path);
+    // Resolve against the PR's files first; only if something still looks
+    // unresolved is the repo-wide tree worth a call.
+    const firstPass = findingLocations(
+      {
+        file: finding.file,
+        startLine: finding.startLine,
+        endLine: finding.endLine,
+        summary: finding.summary,
+        background: finding.background,
+        problem: finding.problem,
+        suggestedFix: finding.suggestedFix,
+        references: finding.references,
+      },
+      (file) => resolveCitedPath(file, prPaths),
+    );
+    const treePaths = firstPass.some((location) => needsPathResolution(location.file, prPaths))
+      ? await repoTree(finding.reviewId, review.repo, sha)
+      : [];
 
     const locations: FindingLocation[] = findingLocations({
       file: finding.file,
@@ -1231,7 +1322,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       problem: finding.problem,
       suggestedFix: finding.suggestedFix,
       references: finding.references,
-    });
+    }, (file) => resolveCitedPath(file, prPaths, treePaths));
 
     const resolved = await Promise.all(
       locations.map(async (location) => {
@@ -1265,8 +1356,8 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         // it rather than nothing.
         const start = location.startLine ?? 1;
         const end = location.endLine ?? start;
-        const from = Math.max(1, start - context);
-        const to = Math.min(all.length, end + context);
+        const from = Math.max(1, start - contextLines);
+        const to = Math.min(all.length, end + contextLines);
         return {
           ...base,
           firstLine: from,
@@ -1277,7 +1368,14 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         };
       }),
     );
-    return { prUrl: githubPrUrl(review.repo, review.number), locations: resolved };
+    return {
+      prUrl: githubPrUrl(review.repo, review.number),
+      headSha: sha,
+      // False when the code shown was fetched after the fact, so its line
+      // numbers may have moved since the finding was written.
+      isReviewedCommit: stored?.atReviewStart ?? false,
+      locations: resolved,
+    };
   }
 
   // -------------------------------------------------------------------------

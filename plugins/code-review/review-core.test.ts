@@ -10,7 +10,9 @@ import {
   parsePullRequests,
   parseReport,
   parseRepoList,
+  needsPathResolution,
   parseSkillList,
+  resolveCitedPath,
   splitUnifiedDiff,
   type PullRequest,
 } from "./review-core";
@@ -467,5 +469,68 @@ describe("formatFileList", () => {
     expect(text).toContain("too large");
     expect(text).toContain("bb code-review diff --review acme/app#7 --file src/a.ts");
     expect(text).toContain("bb code-review diff --review acme/app#7 --file src/b.ts");
+  });
+});
+
+describe("resolveCitedPath", () => {
+  const paths = [
+    "e2e-tests/tests/login.spec.ts",
+    "e2e-tests/fixtures/account.ts",
+    "server/login.spec.ts",
+  ];
+
+  it("expands a bare filename to the PR's path when it is unambiguous", () => {
+    expect(resolveCitedPath("account.ts", paths)).toBe("e2e-tests/fixtures/account.ts");
+  });
+
+  it("leaves an ambiguous filename alone rather than guessing", () => {
+    // Two files end in login.spec.ts; picking one would be a coin flip.
+    expect(resolveCitedPath("login.spec.ts", paths)).toBe("login.spec.ts");
+  });
+
+  it("passes an exact path through untouched", () => {
+    expect(resolveCitedPath("server/login.spec.ts", paths)).toBe("server/login.spec.ts");
+  });
+
+  it("leaves a path the PR does not touch alone", () => {
+    expect(resolveCitedPath("src/elsewhere.ts", paths)).toBe("src/elsewhere.ts");
+  });
+
+  it("expands a partial path, not just a basename", () => {
+    expect(resolveCitedPath("tests/login.spec.ts", paths)).toBe("e2e-tests/tests/login.spec.ts");
+  });
+
+  it("does nothing when the PR's file list is unknown", () => {
+    expect(resolveCitedPath("account.ts", [])).toBe("account.ts");
+  });
+
+  it("falls back to the repo tree for code the PR does not touch", () => {
+    // Reviews cite supporting code constantly; it is usually outside the diff.
+    expect(
+      resolveCitedPath("commentslider-skip-vote.spec.ts", paths, [
+        "e2e-tests/tests/commentslider-skip-vote.spec.ts",
+        "docs/notes.md",
+      ]),
+    ).toBe("e2e-tests/tests/commentslider-skip-vote.spec.ts");
+  });
+
+  it("prefers the PR's own file over an identically named one elsewhere", () => {
+    expect(
+      resolveCitedPath("account.ts", paths, ["vendor/account.ts", "other/account.ts"]),
+    ).toBe("e2e-tests/fixtures/account.ts");
+  });
+
+  it("still refuses to guess when the tree is ambiguous too", () => {
+    expect(resolveCitedPath("thing.ts", [], ["a/thing.ts", "b/thing.ts"])).toBe("thing.ts");
+  });
+});
+
+describe("needsPathResolution", () => {
+  it("is false for a path the PR already contains", () => {
+    expect(needsPathResolution("src/a.ts", ["src/a.ts"])).toBe(false);
+  });
+
+  it("is true for anything else, so the tree gets consulted", () => {
+    expect(needsPathResolution("a.ts", ["src/a.ts"])).toBe(true);
   });
 });

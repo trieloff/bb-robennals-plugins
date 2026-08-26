@@ -1140,6 +1140,13 @@ function FindingDetailView({
           )
         }
       >
+        {code.data !== null && !code.data.isReviewedCommit && locations.length > 0 ? (
+          <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            This code is the pull request&apos;s current head, not the commit the review ran
+            against — that commit was not recorded. Line numbers may have moved since the issue
+            was written.
+          </p>
+        ) : null}
         {code.error !== null ? (
           <EmptyState icon="AlertTriangle" title="Could not load the code" detail={code.error} />
         ) : code.isLoading && code.data === null ? (

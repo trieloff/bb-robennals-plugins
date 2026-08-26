@@ -876,16 +876,24 @@ function locationKey(location: { file: string; startLine: number | null }): stri
  * prose. Deduplicated, because a finding usually does all three for the same
  * line.
  */
-export function findingLocations(finding: {
-  file: string;
-  startLine: number | null;
-  endLine: number | null;
-  summary?: string;
-  background: string;
-  problem: string;
-  suggestedFix: string;
-  references?: Reference[];
-}): FindingLocation[] {
+export function findingLocations(
+  finding: {
+    file: string;
+    startLine: number | null;
+    endLine: number | null;
+    summary?: string;
+    background: string;
+    problem: string;
+    suggestedFix: string;
+    references?: Reference[];
+  },
+  /**
+   * Maps a cited path to its real one. Applied BEFORE deduplication, so a
+   * finding that says both "a.ts:10" and "src/a.ts:10" yields one location
+   * rather than two of the same line.
+   */
+  resolvePath: (file: string) => string = (file) => file,
+): FindingLocation[] {
   const locations: FindingLocation[] = [
     {
       file: finding.file,
@@ -908,12 +916,14 @@ export function findingLocations(finding: {
     locations.push({ ...citation, note: "", isPrimary: false });
   }
   const seen = new Set<string>();
-  return locations.filter((location) => {
-    const key = locationKey(location);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  return locations
+    .map((location) => ({ ...location, file: resolvePath(location.file) }))
+    .filter((location) => {
+      const key = locationKey(location);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 /** Trim prose to a sentence boundary near `limit` characters. */
@@ -958,4 +968,33 @@ export function githubPrFileUrl(args: {
   const suffix =
     args.line == null ? "" : `${args.side === "LEFT" ? "L" : "R"}${args.line}`;
   return `${githubPrUrl(args.repo, args.number)}/files#diff-${args.pathDigest}${suffix}`;
+}
+
+/**
+ * Resolve a cited path against the paths the PR actually touches.
+ *
+ * Agents cite bare filenames constantly — "login.spec.ts:28" when the file is
+ * really "e2e-tests/tests/login.spec.ts". Left alone those 404, so a useful
+ * reference turns into a broken row. A suffix match against the PR's own file
+ * list fixes the common case; anything ambiguous is left exactly as written
+ * rather than guessed at.
+ */
+export function resolveCitedPath(
+  file: string,
+  /** The PR's own files, tried first — the likeliest thing a review means. */
+  preferredPaths: readonly string[],
+  /** Every path in the repo, for citations to code the PR does not touch. */
+  allPaths: readonly string[] = [],
+): string {
+  const unique = (paths: readonly string[]): string | null => {
+    if (paths.includes(file)) return file;
+    const matches = paths.filter((candidate) => candidate.endsWith(`/${file}`));
+    return matches.length === 1 ? (matches[0] as string) : null;
+  };
+  return unique(preferredPaths) ?? unique(allPaths) ?? file;
+}
+
+/** True when a path still looks like a bare or partial citation. */
+export function needsPathResolution(file: string, knownPaths: readonly string[]): boolean {
+  return !knownPaths.includes(file);
 }

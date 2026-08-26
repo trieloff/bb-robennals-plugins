@@ -97,6 +97,7 @@ async function makeHost(
     "pr diff":
       "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b",
     "api -X": JSON.stringify({ html_url: "https://github.com/acme/app/pull/7#c1" }),
+    "api repos/acme/app/git/trees": "vendor/outside.ts\nsrc/a.ts\nsrc/other.ts",
     "api repos/acme/app/contents": JSON.stringify({
       encoding: "base64",
       content: Buffer.from(
@@ -915,7 +916,80 @@ describe("the code an issue points at", () => {
     expect(code.locations[1]?.isPrimary).toBe(false);
   });
 
-  it("shows an explicit reference with the note that explains it", async () => {
+it("expands a bare filename the agent cited into the PR's real path", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          { ...FINDING, problem: "Unlike a.ts:4, which retries." },
+        ]),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{
+      locations: Array<{ file: string; startLine: number | null }>;
+    }>("getFindingCode", { findingId: finding?.id });
+    // "a.ts:4" resolves against the PR's own file list to src/a.ts, and stays
+    // a separate location because it points at a different line.
+    expect(code.locations.map((location) => location.file)).toEqual(["src/a.ts", "src/a.ts"]);
+    expect(code.locations.map((location) => location.startLine)).toEqual([10, 4]);
+  });
+
+  it("explains a cited file that is not in the repo, without the raw gh error", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([{ ...FINDING, problem: "See made/up/thing.ts:9 for the pattern." }]),
+      },
+      ghFailures: { "api repos/acme/app/contents/made/up/thing.ts": "gh: Not Found (HTTP 404)" },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ file: string; error: string | null }> }>(
+      "getFindingCode",
+      { findingId: finding?.id },
+    );
+    const missing = code.locations.find((location) => location.file === "made/up/thing.ts");
+    expect(missing?.error).toContain("is not in the repository at");
+    expect(missing?.error).not.toContain("gh:");
+  });
+
+  it("does not show one line twice when the finding cites it two ways", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          { ...FINDING, problem: "Also written as a.ts:10 elsewhere in this text." },
+        ]),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ file: string; startLine: number }> }>(
+      "getFindingCode",
+      { findingId: finding?.id },
+    );
+    expect(code.locations).toHaveLength(1);
+    expect(code.locations[0]?.file).toBe("src/a.ts");
+  });
+
+  it("resolves a citation to code outside the PR using the repo tree", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([{ ...FINDING, problem: "Unlike outside.ts:3, which retries." }]),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ file: string }> }>("getFindingCode", {
+      findingId: finding?.id,
+    });
+    expect(code.locations.map((location) => location.file)).toContain("vendor/outside.ts");
+  });
+
+  it("does not read the repo tree when every citation is a PR file", async () => {
+    // The tree is a whole extra API call; it is only worth it on a miss.
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("getFindingCode", { findingId: finding?.id });
+    expect(host.calls.filter((entry) => entry.args.join(" ").includes("/git/trees/"))).toEqual([]);
+  });
+
+    it("shows an explicit reference with the note that explains it", async () => {
     const host = await makeHost({
       files: {
         "/w/f.json": report([
@@ -947,7 +1021,7 @@ describe("the code an issue points at", () => {
       "getFindingCode",
       { findingId: finding?.id },
     );
-    expect(code.locations[0]?.error).toContain("404");
+    expect(code.locations[0]?.error).toContain("is not in the repository at");
     expect(code.locations[0]?.lines).toEqual([]);
   });
 
@@ -975,6 +1049,60 @@ describe("the code an issue points at", () => {
     expect(
       host.calls.filter((entry) => entry.args.join(" ").includes("/contents/")).length,
     ).toBeGreaterThan(before);
+  });
+});
+
+describe("a review with no stored commit", () => {
+  /** Drop the snapshot, the way a review from before snapshots existed has none. */
+  function forgetSnapshot(host: Host) {
+    host.bb.storage.database().prepare(`DELETE FROM review_context`).run();
+  }
+
+  it("fetches the code rather than making the user re-run the review", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    forgetSnapshot(host);
+
+    const code = await host.call<{
+      isReviewedCommit: boolean;
+      headSha: string;
+      locations: Array<{ lines: string[]; error: string | null }>;
+    }>("getFindingCode", { findingId: finding?.id, context: 2 });
+
+    expect(code.locations[0]?.error).toBeNull();
+    expect(code.locations[0]?.lines.length).toBeGreaterThan(0);
+    expect(code.headSha).toBe("sha7");
+  });
+
+  it("says the code is not the commit that was reviewed", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    forgetSnapshot(host);
+    const code = await host.call<{ isReviewedCommit: boolean }>("getFindingCode", {
+      findingId: finding?.id,
+    });
+    expect(code.isReviewedCommit).toBe(false);
+  });
+
+  it("reports the reviewed commit as such when it was recorded", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ isReviewedCommit: boolean }>("getFindingCode", {
+      findingId: finding?.id,
+    });
+    expect(code.isReviewedCommit).toBe(true);
+  });
+
+  it("re-fetches only once, then serves the recovered snapshot", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    forgetSnapshot(host);
+    await host.call("getFindingCode", { findingId: finding?.id });
+    const after = host.calls.filter((entry) => entry.args.join(" ").startsWith("pr diff")).length;
+    await host.call("getFindingCode", { findingId: finding?.id, context: 25 });
+    expect(host.calls.filter((entry) => entry.args.join(" ").startsWith("pr diff")).length).toBe(
+      after,
+    );
   });
 });
 
