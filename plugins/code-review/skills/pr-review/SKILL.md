@@ -80,6 +80,25 @@ a specific file and line for is not worth the user's time to triage. If you
 find nothing, submit a file with an empty `findings` array — that is a
 meaningful result, not a failure.
 
+## Paths must be full and real
+
+Every path you write — `file`, every `references` entry, and any `path:line`
+you cite in prose — must be the **full repo-relative path**:
+
+```
+e2e-tests/tests/login.spec.ts:28     yes
+login.spec.ts:28                     no
+```
+
+`bb code-review submit` checks each one against the repository and **rejects
+the whole file** if any path does not exist, listing the bad ones with the
+likely intended path. Fix them and submit again. `bb code-review files` lists
+the PR's paths; the diff shows them too.
+
+This matters because the panel shows the code at each path next to the finding.
+A bare filename is ambiguous — a real repo has dozens of `index.ts` — so the
+reviewer either sees the wrong file or none.
+
 ## Rules
 
 - **Do not run `gh`.** Everything about the PR is available from

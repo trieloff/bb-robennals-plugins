@@ -97,7 +97,7 @@ async function makeHost(
     "pr diff":
       "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b",
     "api -X": JSON.stringify({ html_url: "https://github.com/acme/app/pull/7#c1" }),
-    "api repos/acme/app/git/trees": "vendor/outside.ts\nsrc/a.ts\nsrc/other.ts",
+    "api repos/acme/app/git/trees": "vendor/outside.ts\nsrc/a.ts\nsrc/other.ts\nsrc/ref.ts",
     "api repos/acme/app/contents": JSON.stringify({
       encoding: "base64",
       content: Buffer.from(
@@ -497,6 +497,80 @@ describe("submitting findings", () => {
     const host = await makeHost({ files: { "/w/f.json": report([], "nothing to flag") } });
     expect(await runReview(host)).toEqual([]);
     expect((await host.review()).status).toBe("reported");
+  });
+});
+
+describe("paths in a submitted report", () => {
+  it("rejects a bare filename and names the file it probably meant", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([{ ...FINDING, file: "a.ts" }]),
+      },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("does not name a real file");
+    expect(result.stderr).toContain("finding 1, file: a.ts");
+    expect(result.stderr).toContain("did you mean src/a.ts?");
+    // Nothing is imported, so the agent fixes and resubmits.
+    expect(await host.findings()).toEqual([]);
+  });
+
+  it("rejects a bad path inside references, naming the entry", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          {
+            ...FINDING,
+            references: [{ file: "nope.ts", startLine: 1, endLine: 1, note: "n" }],
+          },
+        ]),
+      },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("references[0].file: nope.ts");
+    expect(result.stderr).toContain("no file with that name exists");
+  });
+
+  it("lists every candidate when a name is genuinely ambiguous", async () => {
+    const host = await makeHost({
+      ghOverrides: { "api repos/acme/app/git/trees": "a/dup.ts\nb/dup.ts\nsrc/a.ts" },
+      files: { "/w/f.json": report([{ ...FINDING, file: "dup.ts" }]) },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("could be: a/dup.ts, b/dup.ts");
+  });
+
+  it("accepts full repo-relative paths", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(await host.findings()).toHaveLength(1);
+  });
+
+  it("does not block a submit when the repo tree cannot be read", async () => {
+    // Validation is a guard rail, not a gate: losing a whole review because a
+    // tree lookup failed would be worse than an unresolved path.
+    const host = await makeHost({
+      ghFailures: { "api repos/acme/app/git/trees": "500" },
+      files: { "/w/f.json": report([{ ...FINDING, file: "a.ts" }]) },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode, result.stderr).toBe(0);
+  });
+
+  it("still accepts an empty report without a tree lookup", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report([]) } });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect((await host.submit()).exitCode).toBe(0);
+    expect(host.calls.filter((entry) => entry.args.join(" ").includes("/git/trees/"))).toEqual([]);
   });
 });
 
@@ -982,11 +1056,15 @@ it("expands a bare filename the agent cited into the PR's real path", async () =
   });
 
   it("does not read the repo tree when every citation is a PR file", async () => {
-    // The tree is a whole extra API call; it is only worth it on a miss.
+    // The tree is a whole extra API call; showing code is only worth it on a
+    // miss. (Submit reads it once to validate paths, hence the baseline.)
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
+    const treeCalls = () =>
+      host.calls.filter((entry) => entry.args.join(" ").includes("/git/trees/")).length;
+    const before = treeCalls();
     await host.call("getFindingCode", { findingId: finding?.id });
-    expect(host.calls.filter((entry) => entry.args.join(" ").includes("/git/trees/"))).toEqual([]);
+    expect(treeCalls()).toBe(before);
   });
 
     it("shows an explicit reference with the note that explains it", async () => {

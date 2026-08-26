@@ -209,7 +209,7 @@ export const FINDINGS_SCHEMA_TEXT = `{
   "summary": "one paragraph on the change overall",
   "findings": [
     {
-      "file": "src/server/auth.ts",       // repo-relative path
+      "file": "src/server/auth.ts",       // FULL repo-relative path, never a bare filename
       "startLine": 42,                     // first affected line in the NEW file (null if none)
       "endLine": 45,                       // last affected line; same as startLine for one line
       "side": "RIGHT",                     // RIGHT = the new file, LEFT = the old file
@@ -222,7 +222,8 @@ export const FINDINGS_SCHEMA_TEXT = `{
       "suggestedFix": "How you would fix it.",
       "suggestedComment": "The exact review comment text to post on the PR.",
       "references": [                      // other code that supports the finding
-        { "file": "src/server/session.ts", "startLine": 88, "endLine": 92,
+        { "file": "src/server/session.ts",  // full repo-relative path here too
+          "startLine": 88, "endLine": 92,
           "note": "the comparison this one should match" }
       ]
     }
@@ -294,6 +295,11 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "",
     "`suggestedComment` is posted verbatim to GitHub, so write it as a review comment",
     "addressed to the PR author — not as a note to yourself. Keep it specific and short.",
+    "",
+    "**Every path must be the full repo-relative path** — `e2e-tests/tests/login.spec.ts`,",
+    "never `login.spec.ts`. That applies to `file`, to every `references` entry, and to any",
+    "`path:line` you cite in your prose. Submitting is rejected if a path is not a real file",
+    "in the repository, so use `bb code-review files` or the diff to check one you are unsure of.",
     "",
     "## 4. Submit them",
     "",
@@ -979,22 +985,138 @@ export function githubPrFileUrl(args: {
  * list fixes the common case; anything ambiguous is left exactly as written
  * rather than guessed at.
  */
+/** Directory segments of a path, e.g. "a/b/c.ts" -> ["a", "b"]. */
+function directorySegments(path: string): string[] {
+  return path.split("/").slice(0, -1);
+}
+
+/** How many leading directory segments two paths share. */
+function sharedDepth(a: string, b: string): number {
+  const left = directorySegments(a);
+  const right = directorySegments(b);
+  let depth = 0;
+  while (depth < left.length && depth < right.length && left[depth] === right[depth]) depth += 1;
+  return depth;
+}
+
+function pickCandidate(file: string, paths: readonly string[], nearTo: string): string | null {
+  if (paths.includes(file)) return file;
+  const candidates = paths.filter((candidate) => candidate.endsWith(`/${file}`));
+  if (candidates.length <= 1) return candidates[0] ?? null;
+  if (nearTo === "") return null;
+  // Several files share this name — "index.ts" and friends are a quarter of a
+  // real repo — so rank by how much of the directory path they share with the
+  // file the finding is about.
+  const ranked = candidates
+    .map((candidate) => ({ candidate, depth: sharedDepth(candidate, nearTo) }))
+    .sort((a, b) => b.depth - a.depth);
+  const best = ranked[0];
+  if (best === undefined) return null;
+  // A tie at the top is a genuine coin flip; leave it unresolved.
+  if (ranked[1]?.depth === best.depth) return null;
+  // Sharing only a top-level directory is not proximity: for a finding in
+  // packages/shared/src/orpc/procedures, "packages/theme/src/index.ts" shares
+  // one segment and is plainly the wrong index.ts. Require the candidate to
+  // sit under at least half of the target's directories.
+  return best.depth * 2 >= directorySegments(nearTo).length ? best.candidate : null;
+}
+
+/**
+ * Resolve a cited path against the repo.
+ *
+ * Findings are required to carry full repo-relative paths and `bb code-review
+ * submit` rejects ones that do not, so this is a fallback for the times an
+ * agent does it anyway, and for findings recorded before the rule existed.
+ * Exact match wins, then a single possibility, then the candidate nearest the
+ * file the finding is about. A real tie is left as written.
+ */
 export function resolveCitedPath(
   file: string,
   /** The PR's own files, tried first — the likeliest thing a review means. */
   preferredPaths: readonly string[],
-  /** Every path in the repo, for citations to code the PR does not touch. */
+  /** Every path in the repo, for code the PR does not touch. */
   allPaths: readonly string[] = [],
+  /** The finding's own file; ties break toward its neighbours. */
+  nearTo = "",
 ): string {
-  const unique = (paths: readonly string[]): string | null => {
-    if (paths.includes(file)) return file;
-    const matches = paths.filter((candidate) => candidate.endsWith(`/${file}`));
-    return matches.length === 1 ? (matches[0] as string) : null;
-  };
-  return unique(preferredPaths) ?? unique(allPaths) ?? file;
+  return (
+    pickCandidate(file, preferredPaths, nearTo) ??
+    pickCandidate(file, allPaths, nearTo) ??
+    file
+  );
+}
+
+/** Every path in the repo that a citation could plausibly have meant. */
+export function citationCandidates(
+  file: string,
+  allPaths: readonly string[],
+): string[] {
+  return allPaths.filter((candidate) => candidate === file || candidate.endsWith(`/${file}`));
 }
 
 /** True when a path still looks like a bare or partial citation. */
 export function needsPathResolution(file: string, knownPaths: readonly string[]): boolean {
   return !knownPaths.includes(file);
+}
+
+
+/** A finding path that does not name a real file in the repository. */
+export interface BadPath {
+  /** 1-based index of the finding in the submitted file. */
+  finding: number;
+  field: string;
+  file: string;
+  candidates: string[];
+}
+
+/**
+ * Check every path a report cites against the repository's real paths.
+ *
+ * This is what makes "use full repo-relative paths" more than advice: submit
+ * refuses the file and names each bad path, so the agent fixes them rather
+ * than leaving the panel to guess later.
+ */
+export function findBadPaths(
+  findings: readonly Finding[],
+  repoPaths: readonly string[],
+): BadPath[] {
+  if (repoPaths.length === 0) return [];
+  const known = new Set(repoPaths);
+  const bad: BadPath[] = [];
+  const check = (index: number, field: string, file: string) => {
+    if (known.has(file)) return;
+    bad.push({
+      finding: index + 1,
+      field,
+      file,
+      candidates: citationCandidates(file, repoPaths).slice(0, 5),
+    });
+  };
+  findings.forEach((finding, index) => {
+    check(index, "file", finding.file);
+    finding.references.forEach((reference, refIndex) => {
+      check(index, `references[${refIndex}].file`, reference.file);
+    });
+  });
+  return bad;
+}
+
+/** The message `submit` prints when a report cites paths that do not exist. */
+export function formatBadPaths(bad: readonly BadPath[]): string {
+  return [
+    `${bad.length} path${bad.length === 1 ? " does" : "s do"} not name a real file in the repository.`,
+    "Use the full repo-relative path, as `bb code-review files` lists them:",
+    "",
+    ...bad.map((entry) => {
+      const suggestion =
+        entry.candidates.length === 1
+          ? `  -> did you mean ${entry.candidates[0]}?`
+          : entry.candidates.length > 1
+            ? `  -> could be: ${entry.candidates.join(", ")}`
+            : "  -> no file with that name exists at this commit";
+      return `finding ${entry.finding}, ${entry.field}: ${entry.file}\n${suggestion}`;
+    }),
+    "",
+    "Fix the paths and submit again.",
+  ].join("\n");
 }

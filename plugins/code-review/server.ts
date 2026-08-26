@@ -30,6 +30,9 @@ import {
   formatFileList,
   githubPrFileUrl,
   githubPrUrl,
+  citationCandidates,
+  findBadPaths,
+  formatBadPaths,
   needsPathResolution,
   resolveCitedPath,
   filterPullRequests,
@@ -1307,7 +1310,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         suggestedFix: finding.suggestedFix,
         references: finding.references,
       },
-      (file) => resolveCitedPath(file, prPaths),
+      (file) => resolveCitedPath(file, prPaths, [], finding.file),
     );
     const treePaths = firstPass.some((location) => needsPathResolution(location.file, prPaths))
       ? await repoTree(finding.reviewId, review.repo, sha)
@@ -1322,7 +1325,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       problem: finding.problem,
       suggestedFix: finding.suggestedFix,
       references: finding.references,
-    }, (file) => resolveCitedPath(file, prPaths, treePaths));
+    }, (file) => resolveCitedPath(file, prPaths, treePaths, finding.file));
 
     const resolved = await Promise.all(
       locations.map(async (location) => {
@@ -1349,7 +1352,14 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           location.file,
         );
         if (content === null) {
-          return { ...base, hasMoreAbove: false, hasMoreBelow: false, error };
+          // An unresolved citation is more useful with its candidates than
+          // with a bare "not found".
+          const candidates = citationCandidates(location.file, treePaths).slice(0, 5);
+          const detail =
+            candidates.length > 1
+              ? `${error} It could be: ${candidates.join(", ")}.`
+              : error;
+          return { ...base, hasMoreAbove: false, hasMoreBelow: false, error: detail };
         }
         const all = content.split("\n");
         // No line anchor means the whole file is the subject; show the head of
@@ -1687,6 +1697,16 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
                 `${absolute} is not a valid findings file — ${errors.join("; ")}\n\n` +
                 `Expected shape:\n${FINDINGS_SCHEMA_TEXT}`,
             };
+          }
+          // Enforce full repo-relative paths here, where the agent can still
+          // fix them, rather than leaving the panel to resolve them later.
+          const snapshot = getContext(reviewId)?.snapshot ?? null;
+          if (snapshot !== null && report.findings.length > 0) {
+            const repoPaths = await repoTree(reviewId, review.repo, snapshot.headSha);
+            const bad = findBadPaths(report.findings, repoPaths);
+            if (bad.length > 0) {
+              return { exitCode: 1, stderr: formatBadPaths(bad) };
+            }
           }
           touchReview(reviewId, { findings_path: absolute });
           const count = importFindings(reviewId, report.findings, report.summary);
