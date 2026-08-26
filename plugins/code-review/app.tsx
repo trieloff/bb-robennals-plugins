@@ -223,21 +223,32 @@ function locationLabel(target: {
  * anchor can only become a general PR comment — so say which it will be
  * rather than leaving the reviewer to find out after pressing the button.
  */
-function postTargetLabel(finding: {
-  file: string;
-  startLine: number | null;
-  endLine: number | null;
-  side: "LEFT" | "RIGHT";
-}): string {
+function postTargetLabel(finding: FindingDto): { text: string; note: string | null } {
   if (finding.startLine === null) {
-    return "as a general comment on the pull request — this issue has no line anchor";
+    return {
+      text: "as a general comment on the pull request",
+      note: "This issue has no line anchor, so it cannot be an inline comment.",
+    };
+  }
+  const anchor = finding.postAnchor;
+  if (anchor === null) {
+    return {
+      text: "as a general comment on the pull request",
+      note:
+        `GitHub only accepts inline comments on lines that are part of the diff, and ` +
+        `${locationLabel(finding)} is not.`,
+    };
   }
   const range =
-    finding.endLine !== null && finding.endLine !== finding.startLine
-      ? `lines ${finding.startLine}–${finding.endLine}`
-      : `line ${finding.startLine}`;
+    anchor.startLine !== null ? `lines ${anchor.startLine}–${anchor.line}` : `line ${anchor.line}`;
   const side = finding.side === "LEFT" ? " of the old file" : "";
-  return `on ${finding.file}, ${range}${side}`;
+  return {
+    text: `on ${finding.file}, ${range}${side}`,
+    note: anchor.adjusted
+      ? `Narrowed from ${locationLabel(finding)}: the rest of that range is not in the diff, ` +
+        "and GitHub only anchors comments inside it."
+      : null,
+  };
 }
 
 /**
@@ -618,7 +629,7 @@ function FindingRow({ finding, onOpen }: { finding: FindingDto; onOpen: () => vo
         {finding.state === "posted" ? (
           <Badge variant="outline" className="shrink-0 gap-1 border-border">
             <Icon name="Check" className="size-3" />
-            posted
+            {finding.postedAs === "pending-review" ? "drafted" : "posted"}
           </Badge>
         ) : null}
         <Icon name="ChevronRight" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
@@ -911,12 +922,15 @@ function FindingActions({
   rpc,
   finding,
   diffUrl,
+  hasPendingReview,
   onDiscuss,
 }: {
   rpc: Rpc;
   finding: FindingDto;
   /** The finding's own place in the PR diff, when the code has been resolved. */
   diffUrl?: string;
+  /** The reviewer already has an unsubmitted review open on this PR. */
+  hasPendingReview: boolean;
   onDiscuss: (finding: FindingDto) => void;
 }) {
   const stored = finding.draftComment ?? finding.suggestedComment;
@@ -937,6 +951,10 @@ function FindingActions({
   const isPosted = finding.state === "posted";
   const commentRef = useAutoSizedTextarea(comment);
   const target = postTargetLabel(finding);
+  const onlyGeneralComment = finding.postAnchor === null;
+  // A comment added to an unsubmitted review is a draft: nobody else can see
+  // it until the review is submitted on GitHub.
+  const isDraft = isPosted && finding.postedAs === "pending-review";
 
   const save = useCallback(
     () =>
@@ -947,7 +965,7 @@ function FindingActions({
   );
 
   const post = useCallback(
-    async (mode: "inline" | "issue") => {
+    async (mode: "inline" | "issue" | "review") => {
       setIsBusy(true);
       try {
         if (isDirty) await save();
@@ -968,7 +986,7 @@ function FindingActions({
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between">
         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          {isPosted ? "Posted comment" : "Comment to post"}
+          {isPosted ? (isDraft ? "Draft comment" : "Posted comment") : "Comment to post"}
         </p>
         {isDirty && !isPosted ? (
           <span className="text-xs text-muted-foreground">unsaved edit</span>
@@ -977,15 +995,30 @@ function FindingActions({
         ) : null}
       </div>
       <p className="-mt-1 text-xs text-muted-foreground">
-        {isPosted ? "Posted " : "Posts "}
-        {diffUrl === undefined || finding.startLine === null ? (
-          <span className="font-mono">{target}</span>
+        {isPosted ? (isDraft ? "Drafted " : "Posted ") : "Posts "}
+        {diffUrl === undefined || onlyGeneralComment ? (
+          <span className="font-mono">{target.text}</span>
         ) : (
           <GithubLink href={diffUrl} className="font-mono underline-offset-4 hover:underline">
-            {target}
+            {target.text}
           </GithubLink>
         )}
       </p>
+      {target.note === null ? null : (
+        <p className="-mt-1 text-xs text-muted-foreground/80">{target.note}</p>
+      )}
+      {!isPosted && hasPendingReview && !onlyGeneralComment ? (
+        <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          You have a review open on this pull request, so this joins it as a draft alongside the
+          comments you made on GitHub. Submit that review on GitHub to publish them together.
+        </p>
+      ) : null}
+      {isDraft ? (
+        <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          You have a review open on this pull request, so this was added to it as a draft.
+          Submit that review on GitHub to publish it.
+        </p>
+      ) : null}
       {isPosted ? (
         <div className="whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-2 text-sm">
           {comment}
@@ -1023,12 +1056,30 @@ function FindingActions({
               size="sm"
               className="h-8 gap-1.5 text-xs"
               disabled={isBusy || comment.trim() === ""}
-              onClick={() => void post("inline")}
+              onClick={() => void post(onlyGeneralComment ? "issue" : "inline")}
             >
               <Icon name="Sent" className="size-3.5" />
-              Post comment
+              {onlyGeneralComment
+                ? "Post as a general comment"
+                : hasPendingReview
+                  ? "Add to my review"
+                  : "Post comment"}
             </Button>
-            {inlineFailed || finding.startLine === null ? (
+            {/* Mirrors GitHub's own split: publish now, or batch into a review.
+                With a review already open, GitHub allows only the batched form,
+                so the single button above already does that. */}
+            {!onlyGeneralComment && !hasPendingReview ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1.5 text-xs"
+                disabled={isBusy || comment.trim() === ""}
+                onClick={() => void post("review")}
+              >
+                Start a review
+              </Button>
+            ) : null}
+            {inlineFailed && !onlyGeneralComment ? (
               <Button
                 size="sm"
                 variant="outline"
@@ -1164,7 +1215,7 @@ function FindingDetailView({
           {finding.state === "posted" ? (
             <Badge variant="outline" className="shrink-0 gap-1 border-border">
               <Icon name="Check" className="size-3" />
-              posted
+              {finding.postedAs === "pending-review" ? "drafted" : "posted"}
             </Badge>
           ) : null}
         </div>
@@ -1183,6 +1234,7 @@ function FindingDetailView({
           rpc={rpc}
           finding={finding}
           diffUrl={locations.find((location) => location.isPrimary)?.diffUrl}
+          hasPendingReview={pr.data?.hasPendingReview ?? false}
           onDiscuss={discuss}
         />
       </div>

@@ -40,6 +40,7 @@ const PR = {
 interface ShellCall {
   file: string;
   args: string[];
+  stdin?: string;
 }
 
 /** The parts of a spawn call these tests assert on. */
@@ -94,9 +95,21 @@ async function makeHost(
     "api --paginate repos": JSON.stringify([
       { path: "src/a.ts", line: 11, user: { login: "sam" }, body: "off by one" },
     ]),
+    // A hunk covering lines 1-20 of the new file, so the fixtures' anchors
+    // (src/a.ts:10-12) are inside the diff the way a real finding's would be.
     "pr diff":
-      "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b",
+      "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,20 +1,20 @@\n-a\n+b",
     "api -X": JSON.stringify({ html_url: "https://github.com/acme/app/pull/7#c1" }),
+    // The pending-review lookup and the add-comment mutation are both
+    // `gh api graphql`; key them by the operation so they can differ.
+    "api graphql -f query=query": "",
+    "api graphql -f query=mutation": JSON.stringify({
+      data: {
+        addPullRequestReviewThread: {
+          thread: { comments: { nodes: [{ url: "https://github.com/acme/app/pull/7#d1" }] } },
+        },
+      },
+    }),
     "api repos/acme/app/git/trees": "vendor/outside.ts\nsrc/a.ts\nsrc/other.ts\nsrc/ref.ts",
     "api repos/acme/app/contents": JSON.stringify({
       encoding: "base64",
@@ -138,8 +151,8 @@ async function makeHost(
   });
 
   await plugin(bb, {
-    async runCommand(file, args) {
-      calls.push({ file, args });
+    async runCommand(file, args, _timeoutMs, stdin) {
+      calls.push({ file, args, stdin });
       if (options.ghMissing === true) throw new Error("spawn gh ENOENT");
       const joined = args.join(" ");
       const failure = Object.keys(failures).find((prefix) => joined.startsWith(prefix));
@@ -689,6 +702,193 @@ describe("editing, posting, and dismissing", () => {
     await expect(call("setFindingComment", { findingId: "nope", comment: "x" })).rejects.toThrow(
       /No finding with id nope/,
     );
+  });
+});
+
+describe("posting while a review is already open on GitHub", () => {
+  const PENDING_ID = "PRR_abc";
+  /** gh --jq reduces the pending-review query to the id, or empty. */
+  const withPending = (overrides: Record<string, string> = {}) => ({
+    "api graphql -f query=query": PENDING_ID,
+    ...overrides,
+  });
+
+  it("adds the comment to the pending review instead of failing", async () => {
+    // GitHub refuses a standalone review comment while the viewer has an
+    // unsubmitted review: "one pending review per pull request".
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: withPending(),
+    });
+    const [finding] = await runReview(host);
+    const posted = await host.call<{ finding: FindingDto }>("postFinding", {
+      findingId: finding?.id,
+      mode: "inline",
+    });
+    expect(posted.finding.state).toBe("posted");
+    expect(posted.finding.postedAs).toBe("pending-review");
+
+    const mutation = host.calls.find((entry) => entry.args.join(" ").includes("addPullRequestReviewThread"));
+    expect(mutation).toBeDefined();
+    expect(mutation?.args).toContain(`reviewId=${PENDING_ID}`);
+    expect(mutation?.args).toContain("path=src/a.ts");
+    expect(mutation?.args).toContain("line=12");
+    expect(mutation?.args).toContain("startLine=10");
+    // The standalone create-comment endpoint must not be attempted at all.
+    // (Reading that same path is how the snapshot fetches review comments, so
+    // match the POST specifically.)
+    const postedStandalone = host.calls.some(
+      (entry) =>
+        entry.args.includes("-X") &&
+        entry.args.includes("POST") &&
+        entry.args.includes("repos/acme/app/pulls/7/comments"),
+    );
+    expect(postedStandalone).toBe(false);
+  });
+
+  it("omits the range arguments for a single-line comment", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report([{ ...FINDING, startLine: 10, endLine: 10 }]) },
+      ghOverrides: withPending(),
+    });
+    const [finding] = await runReview(host);
+    await host.call("postFinding", { findingId: finding?.id, mode: "inline" });
+    const mutation = host.calls.find((entry) => entry.args.join(" ").includes("addPullRequestReviewThread"));
+    expect(mutation?.args.some((arg) => arg.startsWith("startLine="))).toBe(false);
+  });
+
+  it("uses the ordinary endpoint when there is no pending review", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const posted = await host.call<{ finding: FindingDto }>("postFinding", {
+      findingId: finding?.id,
+      mode: "inline",
+    });
+    expect(posted.finding.postedAs).toBe("comment");
+    expect(
+      host.calls.some(
+        (entry) =>
+          entry.args.includes("-X") &&
+          entry.args.includes("POST") &&
+          entry.args.includes("repos/acme/app/pulls/7/comments"),
+      ),
+    ).toBe(true);
+  });
+
+it("starts a pending review when asked and there is none", async () => {
+    // The reviewer wants one draft shared with the GitHub UI, so the plugin
+    // has to be able to open it, not only join one.
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: {
+        "api -X POST repos/acme/app/pulls/7/reviews": JSON.stringify({
+          html_url: "https://github.com/acme/app/pull/7#pullrequestreview-1",
+        }),
+      },
+    });
+    const [finding] = await runReview(host);
+    const posted = await host.call<{ finding: FindingDto }>("postFinding", {
+      findingId: finding?.id,
+      mode: "review",
+    });
+    expect(posted.finding.postedAs).toBe("pending-review");
+
+    const create = host.calls.find((entry) =>
+      entry.args.includes("repos/acme/app/pulls/7/reviews"),
+    );
+    expect(create?.args).toContain("--input");
+    // No `event` field: that is what makes the review PENDING rather than
+    // submitted the moment it is created.
+    const payload = JSON.parse(create?.stdin ?? "{}") as {
+      event?: string;
+      comments: Array<{ path: string; line: number; start_line?: number }>;
+    };
+    expect(payload.event).toBeUndefined();
+    expect(payload.comments[0]?.path).toBe("src/a.ts");
+    expect(payload.comments[0]?.line).toBe(12);
+    expect(payload.comments[0]?.start_line).toBe(10);
+  });
+
+  it("joins the existing review rather than starting a second one", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: { "api graphql -f query=query": "PRR_abc" },
+    });
+    const [finding] = await runReview(host);
+    await host.call("postFinding", { findingId: finding?.id, mode: "review" });
+    expect(
+      host.calls.some((entry) => entry.args.includes("repos/acme/app/pulls/7/reviews")),
+    ).toBe(false);
+    expect(
+      host.calls.some((entry) => entry.args.join(" ").includes("addPullRequestReviewThread")),
+    ).toBe(true);
+  });
+
+  it("tells the panel when a review is already open", async () => {
+    const host = await makeHost({
+      ghOverrides: { "api graphql -f query=query": "PRR_abc" },
+    });
+    const detail = await host.call<{ hasPendingReview: boolean }>("getPullRequest", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(detail.hasPendingReview).toBe(true);
+  });
+
+  it("does not re-ask GitHub for the pending review on every view", async () => {
+    const host = await makeHost();
+    const lookups = () =>
+      host.calls.filter((entry) => entry.args.join(" ").includes("query=query")).length;
+    await host.call("getPullRequest", { repo: REPO, number: 7 });
+    const after = lookups();
+    await host.call("getPullRequest", { repo: REPO, number: 7 });
+    expect(lookups()).toBe(after);
+  });
+
+    it("explains a line GitHub will not place a thread on", async () => {
+    // A null thread with no error means there is already a thread there.
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: withPending({
+        "api graphql -f query=mutation": JSON.stringify({
+          data: { addPullRequestReviewThread: { thread: null } },
+        }),
+      }),
+    });
+    const [finding] = await runReview(host);
+    await expect(
+      host.call("postFinding", { findingId: finding?.id, mode: "inline" }),
+    ).rejects.toThrow(/a comment thread already exists there/);
+    // Nothing is marked posted on a failure.
+    expect((await host.findings())[0]?.state).toBe("open");
+  });
+
+  it("still posts a general PR comment without consulting pending reviews", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: withPending(),
+    });
+    const [finding] = await runReview(host);
+    const before = host.calls.length;
+    await host.call("postFinding", { findingId: finding?.id, mode: "issue" });
+    const graphqlCalls = host.calls
+      .slice(before)
+      .filter((entry) => entry.args.join(" ").includes("graphql"));
+    expect(graphqlCalls).toEqual([]);
+  });
+
+  it("posts normally when the pending-review lookup fails", async () => {
+    // The lookup is an optimisation; losing it must not block posting.
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghFailures: { "api graphql -f query=query": "500" },
+    });
+    const [finding] = await runReview(host);
+    const posted = await host.call<{ finding: FindingDto }>("postFinding", {
+      findingId: finding?.id,
+      mode: "inline",
+    });
+    expect(posted.finding.postedAs).toBe("comment");
   });
 });
 

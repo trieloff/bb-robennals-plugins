@@ -75,6 +75,8 @@ const FINDING: FindingDto = {
   state: "open",
   commentUrl: null,
   postedAt: null,
+  postedAs: "comment",
+  postAnchor: { line: 12, startLine: 10, adjusted: false },
   discussionThreadId: null,
   references: [],
 };
@@ -116,7 +118,12 @@ function rpc(overrides: Record<string, unknown> = {}) {
   return {
     status: () => READY,
     listPullRequests: () => ({ pullRequests: [PR] }),
-    getPullRequest: () => ({ pullRequest: PR, review: REVIEW, findings: [FINDING] }),
+    getPullRequest: () => ({
+      pullRequest: PR,
+      review: REVIEW,
+      findings: [FINDING],
+      hasPendingReview: false,
+    }),
     getFindingCode: () => CODE,
     getPanelState: () => ({ repo: null, filter: null }),
     setPanelState: () => ({ repo: null, filter: null }),
@@ -227,6 +234,7 @@ describe("a PR's issue list", () => {
             pullRequest: PR,
             review: REVIEW,
             findings: [{ ...FINDING, summary: "", gist: "It runs one past the end." }],
+      hasPendingReview: false,
           }),
         }),
       },
@@ -246,6 +254,7 @@ describe("a PR's issue list", () => {
             pullRequest: { ...PR, reviewStatus: "none", openFindings: 0 },
             review: null,
             findings: [],
+            hasPendingReview: false,
           }),
         }),
       },
@@ -266,6 +275,7 @@ describe("a PR's issue list", () => {
             pullRequest: PR,
             review: { ...REVIEW, status: "failed", error: "the thread gave up" },
             findings: [],
+            hasPendingReview: false,
           }),
         }),
       },
@@ -379,6 +389,7 @@ describe("an issue and its code", () => {
                 commentUrl: "https://github.com/acme/app/pull/7#c1",
               },
             ],
+            hasPendingReview: false,
           }),
         }),
       },
@@ -578,6 +589,7 @@ describe("the comment to post", () => {
             pullRequest: PR,
             review: REVIEW,
             findings: [{ ...FINDING, ...overrides }],
+            hasPendingReview: false,
           }),
         }),
       },
@@ -591,19 +603,32 @@ describe("the comment to post", () => {
   });
 
   it("says a single line as a line, not a range", async () => {
-    const slot = await withFinding({ startLine: 10, endLine: 10 });
+    const slot = await withFinding({
+      startLine: 10,
+      endLine: 10,
+      postAnchor: { line: 10, startLine: null, adjusted: false },
+    });
     await slot.findByText("on src/a.ts, line 10");
     slot.lifecycle.unmount();
   });
 
   it("treats a null endLine as a single line", async () => {
-    const slot = await withFinding({ startLine: 10, endLine: null });
+    const slot = await withFinding({
+      startLine: 10,
+      endLine: null,
+      postAnchor: { line: 10, startLine: null, adjusted: false },
+    });
     await slot.findByText("on src/a.ts, line 10");
     slot.lifecycle.unmount();
   });
 
   it("says when the anchor is on the old side of the diff", async () => {
-    const slot = await withFinding({ side: "LEFT", startLine: 4, endLine: 4 });
+    const slot = await withFinding({
+      side: "LEFT",
+      startLine: 4,
+      endLine: 4,
+      postAnchor: { line: 4, startLine: null, adjusted: false },
+    });
     await slot.findByText("on src/a.ts, line 4 of the old file");
     slot.lifecycle.unmount();
   });
@@ -611,10 +636,9 @@ describe("the comment to post", () => {
   it("warns when the comment can only be a general PR comment", async () => {
     // Without a line anchor, "Post comment" silently becomes an issue comment;
     // the reviewer should know that before pressing it.
-    const slot = await withFinding({ startLine: null, endLine: null });
-    await slot.findByText(
-      "as a general comment on the pull request — this issue has no line anchor",
-    );
+    const slot = await withFinding({ startLine: null, endLine: null, postAnchor: null });
+    await slot.findByText("as a general comment on the pull request");
+    await slot.findByText(/no line anchor/);
     slot.lifecycle.unmount();
   });
 
@@ -647,6 +671,61 @@ describe("the comment to post", () => {
     // Height is driven by content, not by a fixed row count.
     expect(box.getAttribute("rows")).toBe("1");
     expect(box.className).toContain("overflow-hidden");
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("a comment added to a pending review", () => {
+  it("says it is a draft, not a published comment", async () => {
+    // Nobody else can see it until the review is submitted on GitHub, so
+    // calling it "posted" would be a lie.
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7/f/f1" },
+      {
+        rpc: rpc({
+          getPullRequest: () => ({
+            pullRequest: PR,
+            review: REVIEW,
+            findings: [
+              {
+                ...FINDING,
+                state: "posted",
+                postedAs: "pending-review",
+                commentUrl: "https://github.com/acme/app/pull/7#d1",
+              },
+            ],
+            hasPendingReview: false,
+          }),
+        }),
+      },
+    );
+    await slot.findByText("Draft comment");
+    await slot.findByText(/Submit that review on GitHub to publish it/);
+    slot.lifecycle.unmount();
+  });
+
+  it("still says posted for an ordinary published comment", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7/f/f1" },
+      {
+        rpc: rpc({
+          getPullRequest: () => ({
+            pullRequest: PR,
+            review: REVIEW,
+            findings: [
+              { ...FINDING, state: "posted", commentUrl: "https://github.com/acme/app/pull/7#c1" },
+            ],
+            hasPendingReview: false,
+          }),
+        }),
+      },
+    );
+    await slot.findByText("Posted comment");
+    expect(slot.queryByText(/Submit that review on GitHub/)).toBeNull();
     slot.lifecycle.unmount();
   });
 });

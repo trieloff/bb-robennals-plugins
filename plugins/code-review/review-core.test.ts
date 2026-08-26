@@ -10,6 +10,9 @@ import {
   parsePullRequests,
   parseReport,
   parseRepoList,
+  describeGitHubError,
+  diffHunkRanges,
+  resolvePostAnchor,
   needsPathResolution,
   parseSkillList,
   resolveCitedPath,
@@ -532,5 +535,135 @@ describe("needsPathResolution", () => {
 
   it("is true for anything else, so the tree gets consulted", () => {
     expect(needsPathResolution("a.ts", ["src/a.ts"])).toBe(true);
+  });
+});
+
+describe("describeGitHubError", () => {
+  it("surfaces the reason GitHub gave, not just the status line", () => {
+    // The bug this exists for: a 422 reported as "Validation Failed (HTTP 422)"
+    // hid "one pending review per pull request", which is the whole answer.
+    const body = JSON.stringify({
+      message: "Validation Failed",
+      errors: [
+        {
+          resource: "PullRequestReview",
+          code: "custom",
+          field: "user_id",
+          message: "user_id can only have one pending review per pull request",
+        },
+      ],
+    });
+    expect(describeGitHubError(body, "gh: Validation Failed (HTTP 422)")).toBe(
+      "Validation Failed — user_id can only have one pending review per pull request",
+    );
+  });
+
+  it("falls back to a field/code pair when there is no message", () => {
+    const body = JSON.stringify({
+      message: "Validation Failed",
+      errors: [{ field: "line", code: "invalid" }],
+    });
+    expect(describeGitHubError(body, "x")).toBe("Validation Failed — line invalid");
+  });
+
+  it("uses stderr when the body is not JSON", () => {
+    expect(describeGitHubError("not json", "gh: connection refused")).toBe(
+      "gh: connection refused",
+    );
+  });
+
+  it("uses stderr when the body carries nothing useful", () => {
+    expect(describeGitHubError(JSON.stringify({ ok: true }), "gh: boom")).toBe("gh: boom");
+  });
+
+  it("handles a bare message with no errors array", () => {
+    expect(describeGitHubError(JSON.stringify({ message: "Not Found" }), "gh: 404")).toBe(
+      "Not Found",
+    );
+  });
+});
+
+describe("diffHunkRanges", () => {
+  const patch = [
+    "diff --git a/x.ts b/x.ts",
+    "@@ -100,10 +120,18 @@ context",
+    " unchanged",
+    "@@ -140,4 +143,5 @@ context",
+    " unchanged",
+  ].join("\n");
+
+  it("reads the new-file ranges for the right side", () => {
+    expect(diffHunkRanges(patch, "RIGHT")).toEqual([
+      { start: 120, end: 137 },
+      { start: 143, end: 147 },
+    ]);
+  });
+
+  it("reads the old-file ranges for the left side", () => {
+    expect(diffHunkRanges(patch, "LEFT")).toEqual([
+      { start: 100, end: 109 },
+      { start: 140, end: 143 },
+    ]);
+  });
+
+  it("treats a hunk with no count as one line", () => {
+    expect(diffHunkRanges("@@ -1 +5 @@", "RIGHT")).toEqual([{ start: 5, end: 5 }]);
+  });
+
+  it("returns nothing for a patch with no hunks", () => {
+    expect(diffHunkRanges("diff --git a/x b/x\n", "RIGHT")).toEqual([]);
+  });
+});
+
+describe("resolvePostAnchor", () => {
+  // The real case: hunks end at 137, the finding says 137-139.
+  const ranges = [
+    { start: 120, end: 137 },
+    { start: 143, end: 147 },
+  ];
+
+  it("narrows a range that overhangs the diff to the part inside it", () => {
+    const anchor = resolvePostAnchor({ startLine: 137, endLine: 139 }, ranges);
+    expect(anchor).toEqual({ line: 137, startLine: null, adjusted: true });
+  });
+
+  it("keeps a range that fits entirely inside a hunk", () => {
+    expect(resolvePostAnchor({ startLine: 130, endLine: 135 }, ranges)).toEqual({
+      line: 135,
+      startLine: 130,
+      adjusted: false,
+    });
+  });
+
+  it("anchors a single line without a start", () => {
+    expect(resolvePostAnchor({ startLine: 130, endLine: 130 }, ranges)).toEqual({
+      line: 130,
+      startLine: null,
+      adjusted: false,
+    });
+  });
+
+  it("does not span a gap between hunks", () => {
+    // 138-142 are absent, so a 135-145 range must not claim to cover them.
+    const anchor = resolvePostAnchor({ startLine: 135, endLine: 145 }, ranges);
+    expect(anchor?.line).toBe(145);
+    expect(anchor?.startLine).toBe(143);
+    expect(anchor?.adjusted).toBe(true);
+  });
+
+  it("gives up when no part of the range is in the diff", () => {
+    expect(resolvePostAnchor({ startLine: 200, endLine: 210 }, ranges)).toBeNull();
+  });
+
+  it("gives up when the finding has no line anchor", () => {
+    expect(resolvePostAnchor({ startLine: null, endLine: null }, ranges)).toBeNull();
+  });
+
+  it("trusts the finding when the diff is unknown", () => {
+    expect(resolvePostAnchor({ startLine: 5, endLine: 8 }, [])).toEqual({
+      line: 8,
+      startLine: 5,
+      adjusted: false,
+    });
   });
 });

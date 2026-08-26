@@ -1120,3 +1120,126 @@ export function formatBadPaths(bad: readonly BadPath[]): string {
     "Fix the paths and submit again.",
   ].join("\n");
 }
+
+/**
+ * Turn a failed `gh api` call into something a reader can act on.
+ *
+ * gh writes the API response body to stdout and a one-line summary to stderr,
+ * so reporting stderr alone reduces "user_id can only have one pending review
+ * per pull request" to "Validation Failed (HTTP 422)" — the useful half is
+ * exactly the half that was being dropped.
+ */
+export function describeGitHubError(stdout: string, stderr: string): string {
+  const short = stderr.trim();
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (typeof parsed !== "object" || parsed === null) return short;
+    const row = parsed as { message?: unknown; errors?: unknown };
+    const details = Array.isArray(row.errors)
+      ? row.errors
+          .map((entry) => {
+            if (typeof entry === "string") return entry;
+            if (typeof entry !== "object" || entry === null) return "";
+            const detail = entry as { message?: unknown; code?: unknown; field?: unknown };
+            if (typeof detail.message === "string") return detail.message;
+            return typeof detail.code === "string"
+              ? `${String(detail.field ?? "")} ${detail.code}`.trim()
+              : "";
+          })
+          .filter((entry) => entry !== "")
+      : [];
+    const message = typeof row.message === "string" ? row.message : "";
+    const full = [message, ...details].filter((entry) => entry !== "").join(" — ");
+    return full === "" ? short : full;
+  } catch {
+    // Not a JSON body (network error, gh usage error); stderr is all there is.
+    return short;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Where GitHub will actually accept a comment
+// ---------------------------------------------------------------------------
+
+export interface LineRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * The line ranges a unified patch covers, on one side of the diff.
+ *
+ * GitHub only accepts an inline comment on a line inside a diff hunk. A
+ * finding's range routinely runs past one — it describes code, not a hunk — so
+ * posting has to be checked against these rather than hoped for.
+ */
+export function diffHunkRanges(patch: string, side: "LEFT" | "RIGHT"): LineRange[] {
+  const ranges: LineRange[] = [];
+  const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+  for (const line of patch.split("\n")) {
+    const match = line.match(header);
+    if (match === null) continue;
+    const start = Number(side === "LEFT" ? match[1] : match[3]);
+    const countRaw = side === "LEFT" ? match[2] : match[4];
+    const count = countRaw === undefined ? 1 : Number(countRaw);
+    if (!Number.isFinite(start) || count <= 0) continue;
+    ranges.push({ start, end: start + count - 1 });
+  }
+  return ranges;
+}
+
+function inAnyRange(line: number, ranges: readonly LineRange[]): boolean {
+  return ranges.some((range) => line >= range.start && line <= range.end);
+}
+
+export interface PostAnchor {
+  /** The line GitHub will anchor the comment to (the end of the range). */
+  line: number;
+  /** Start of a multi-line comment, or null for a single-line one. */
+  startLine: number | null;
+  /** True when the finding's own range had to be narrowed to fit the diff. */
+  adjusted: boolean;
+}
+
+/**
+ * The anchor GitHub will accept for a finding, or null when none will do.
+ *
+ * A finding's range is about the code, so it often overhangs the diff — the
+ * range 137-139 against hunks ending at 137 is rejected outright, because
+ * GitHub anchors at the last line. Narrowing to the part that is in the diff
+ * puts the comment where the reviewer meant it instead of failing.
+ */
+export function resolvePostAnchor(
+  finding: { startLine: number | null; endLine: number | null },
+  ranges: readonly LineRange[],
+): PostAnchor | null {
+  if (finding.startLine === null) return null;
+  // With no diff to check against, trust the finding and let GitHub rule.
+  if (ranges.length === 0) {
+    const end = finding.endLine ?? finding.startLine;
+    return {
+      line: end,
+      startLine: end > finding.startLine ? finding.startLine : null,
+      adjusted: false,
+    };
+  }
+  const wanted = { start: finding.startLine, end: finding.endLine ?? finding.startLine };
+  const covered: number[] = [];
+  for (let line = wanted.start; line <= wanted.end; line += 1) {
+    if (inAnyRange(line, ranges)) covered.push(line);
+  }
+  if (covered.length === 0) return null;
+  const line = covered[covered.length - 1] as number;
+  const start = covered[0] as number;
+  // A comment range must sit inside one hunk, so only span back as far as the
+  // contiguous run ending at the anchor.
+  let contiguousStart = line;
+  while (contiguousStart > start && covered.includes(contiguousStart - 1)) {
+    contiguousStart -= 1;
+  }
+  return {
+    line,
+    startLine: contiguousStart < line ? contiguousStart : null,
+    adjusted: line !== wanted.end || contiguousStart !== wanted.start,
+  };
+}

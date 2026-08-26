@@ -31,10 +31,13 @@ import {
   githubPrFileUrl,
   githubPrUrl,
   citationCandidates,
+  describeGitHubError,
+  diffHunkRanges,
   findBadPaths,
   formatBadPaths,
   needsPathResolution,
   resolveCitedPath,
+  resolvePostAnchor,
   filterPullRequests,
   isRepoName,
   parseGithubRemote,
@@ -52,6 +55,7 @@ import {
   type Finding,
   type FilePatch,
   type FindingLocation,
+  type PostAnchor,
   type PrSnapshot,
   type PullRequest,
 } from "./review-core";
@@ -118,6 +122,21 @@ const findingSchemaDto = z.object({
   state: z.enum(["open", "posted", "dismissed"]),
   commentUrl: z.string().nullable(),
   postedAt: z.string().nullable(),
+  /** "pending-review" means it is a draft in the user's unsubmitted review. */
+  postedAs: z.enum(["comment", "pending-review"]),
+  /**
+   * Where an inline comment can actually be anchored, given the diff. Null
+   * when no part of the finding's range is in the diff, so only a general
+   * pull request comment is possible.
+   */
+  postAnchor: z
+    .object({
+      line: z.number(),
+      startLine: z.number().nullable(),
+      /** The finding's range had to be narrowed to fit the diff. */
+      adjusted: z.boolean(),
+    })
+    .nullable(),
   discussionThreadId: z.string().nullable(),
   references: z.array(
     z.object({
@@ -205,6 +224,8 @@ export const rpcContract = defineRpcContract({
       pullRequest: pullRequestSchema.nullable(),
       review: reviewSchema.nullable(),
       findings: z.array(findingSchemaDto),
+      /** You already have an unsubmitted review open on this PR. */
+      hasPendingReview: z.boolean(),
     }),
   },
   startReview: {
@@ -230,8 +251,12 @@ export const rpcContract = defineRpcContract({
   postFinding: {
     input: z.object({
       findingId: z.string(),
-      /** "inline" anchors to the file and line; "issue" is a plain PR comment. */
-      mode: z.enum(["inline", "issue"]),
+      /**
+       * "inline" publishes a single anchored comment; "review" puts it in the
+       * pending review, starting one if there is none, so comments made here
+       * and in the GitHub UI batch together; "issue" is a plain PR comment.
+       */
+      mode: z.enum(["inline", "issue", "review"]),
     }),
     output: z.object({ finding: findingSchemaDto }),
   },
@@ -273,9 +298,11 @@ function run(
   file: string,
   args: string[],
   timeoutMs = 30_000,
+  /** Written to the process's stdin, for `gh api --input -`. */
+  stdin?: string,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       file,
       args,
       { timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 },
@@ -284,7 +311,7 @@ function run(
           reject(
             new Error(
               `${path.basename(file)} ${args.slice(0, 3).join(" ")} failed: ${
-                stderr.trim() || error.message
+                describeGitHubError(stdout, stderr) || error.message
               }`,
             ),
           );
@@ -293,6 +320,9 @@ function run(
         }
       },
     );
+    if (stdin !== undefined) {
+      child.stdin?.end(stdin);
+    }
   });
 }
 
@@ -302,6 +332,15 @@ function reviewIdFor(repo: string, number: number): string {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** "path:line" or "path:start-end", for messages. */
+function locationOf(finding: { file: string; startLine: number | null; endLine: number | null }): string {
+  if (finding.startLine === null) return finding.file;
+  const end = finding.endLine;
+  return end !== null && end !== finding.startLine
+    ? `${finding.file}:${finding.startLine}-${end}`
+    : `${finding.file}:${finding.startLine}`;
 }
 
 function requireRepo(repo: string): string {
@@ -368,6 +407,7 @@ interface FindingRow {
   state: string;
   comment_url: string | null;
   posted_at: string | null;
+  posted_as: string;
   discussion_thread_id: string | null;
   references_json: string;
 }
@@ -413,8 +453,11 @@ function toFindingDto(row: FindingRow): FindingDto {
       row.state === "posted" ? "posted" : row.state === "dismissed" ? "dismissed" : "open",
     commentUrl: row.comment_url,
     postedAt: row.posted_at,
+    postedAs: row.posted_as === "pending-review" ? "pending-review" : "comment",
     discussionThreadId: row.discussion_thread_id,
     references: parseJsonArray(row.references_json),
+    // Filled in by listFindings, which has the diff to hand.
+    postAnchor: null,
   };
 }
 
@@ -442,6 +485,7 @@ export interface PluginDependencies {
     file: string,
     args: string[],
     timeoutMs?: number,
+    stdin?: string,
   ) => Promise<{ stdout: string; stderr: string }>;
 }
 
@@ -582,6 +626,24 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
      )`,
   ]);
 
+  /**
+   * Add a column if it is not already there.
+   *
+   * `bb.storage.migrate` applies statements by index, so a statement inserted
+   * above an already-applied one is silently skipped and shows up much later
+   * as "no such column" — which is exactly what happened to `posted_as`.
+   * Checking the table instead is immune to that, and to the same mistake
+   * being made again.
+   */
+  function ensureColumn(table: string, column: string, definition: string): void {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((entry) => entry.name === column)) return;
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+    bb.log.info(`added the ${table}.${column} column`);
+  }
+
+  ensureColumn("findings", "posted_as", `TEXT NOT NULL DEFAULT 'comment'`);
+
   function getReview(reviewId: string): ReviewRow | null {
     return (db.prepare(`SELECT * FROM reviews WHERE id = ?`).get(reviewId) as
       | ReviewRow
@@ -598,7 +660,20 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     const rows = db
       .prepare(`SELECT * FROM findings WHERE review_id = ? ORDER BY ord ASC`)
       .all(reviewId) as FindingRow[];
-    return rows.map(toFindingDto);
+    // Parsing the diff once per list keeps this off the per-finding path.
+    const stored = getContext(reviewId);
+    const patches = stored === null ? [] : splitUnifiedDiff(stored.diff);
+    return rows.map((row) => {
+      const finding = toFindingDto(row);
+      const patch = patches.find((file) => file.path === finding.file);
+      return {
+        ...finding,
+        postAnchor: resolvePostAnchor(
+          finding,
+          patch === undefined ? [] : diffHunkRanges(patch.patch, finding.side),
+        ),
+      };
+    });
   }
 
   function getFinding(findingId: string): FindingRow | null {
@@ -649,8 +724,8 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     throw needsConfiguration(`GitHub CLI not found. ${GH_HINT}`);
   }
 
-  async function gh(args: string[], timeoutMs?: number): Promise<string> {
-    const { stdout } = await runCommand(await resolveGh(), args, timeoutMs);
+  async function gh(args: string[], timeoutMs?: number, stdin?: string): Promise<string> {
+    const { stdout } = await runCommand(await resolveGh(), args, timeoutMs, stdin);
     return stdout;
   }
 
@@ -1078,9 +1153,152 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     return sha;
   }
 
+  /**
+   * The viewer's own unsubmitted review on a PR, if any.
+   *
+   * GitHub allows one pending review per user per PR, and refuses to create a
+   * standalone review comment while one exists — so a reviewer who has started
+   * a review in the GitHub UI cannot post from here unless the comment joins
+   * that review. PENDING reviews are invisible to the REST reviews endpoint,
+   * hence GraphQL.
+   */
+  async function pendingReviewId(repo: string, number: number): Promise<string | null> {
+    const [owner, name] = repo.split("/");
+    try {
+      const raw = await gh(
+        [
+          "api", "graphql",
+          "-f", `query=query($owner:String!,$name:String!,$number:Int!,$viewer:String!){
+            repository(owner:$owner,name:$name){
+              pullRequest(number:$number){
+                reviews(last:20, states:PENDING, author:$viewer){ nodes { id } }
+              } } }`,
+          "-f", `owner=${owner}`,
+          "-f", `name=${name}`,
+          "-F", `number=${number}`,
+          "-f", `viewer=${await getViewer()}`,
+          "--jq", ".data.repository.pullRequest.reviews.nodes[0].id // empty",
+        ],
+        30_000,
+      );
+      const id = raw.trim();
+      return id === "" ? null : id;
+    } catch (error) {
+      // Without this lookup the post still works whenever there is no pending
+      // review, which is the common case; do not fail the post over it.
+      bb.log.warn(`could not look up a pending review on ${repo}#${number}: ${String(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Start a pending review whose first comment is this finding.
+   *
+   * A reviewer works across both surfaces — some comments here, some in the
+   * GitHub UI — so the plugin has to be able to open the shared draft, not
+   * only join one somebody else's UI started.
+   */
+  async function startPendingReview(
+    repo: string,
+    number: number,
+    finding: FindingDto,
+    anchor: PostAnchor,
+    body: string,
+  ): Promise<string> {
+    const comment: Record<string, unknown> = {
+      path: finding.file,
+      line: anchor.line,
+      side: finding.side,
+      body,
+    };
+    if (anchor.startLine !== null) {
+      comment.start_line = anchor.startLine;
+      comment.start_side = finding.side;
+    }
+    // No `event` means the review is created PENDING, which is the point.
+    const raw = await gh(
+      [
+        "api", "-X", "POST", `repos/${repo}/pulls/${number}/reviews`,
+        "--input", "-",
+      ],
+      30_000,
+      JSON.stringify({ commit_id: await headSha(repo, number), comments: [comment] }),
+    );
+    return ghField(raw, "html_url");
+  }
+
+  // One lookup per PR view would be a network call on every render, so hold
+  // the answer briefly. Posting clears it, since posting changes it.
+  const pendingReviewCache = new Map<string, { id: string | null; at: number }>();
+
+  async function cachedPendingReviewId(repo: string, number: number): Promise<string | null> {
+    const key = reviewIdFor(repo, number);
+    const cached = pendingReviewCache.get(key);
+    if (cached !== undefined && Date.now() - cached.at < 30_000) return cached.id;
+    const id = await pendingReviewId(repo, number);
+    pendingReviewCache.set(key, { id, at: Date.now() });
+    return id;
+  }
+
+  /** Add a comment to an existing pending review. Returns its URL. */
+  async function addToPendingReview(
+    reviewId: string,
+    finding: FindingDto,
+    anchor: PostAnchor,
+    body: string,
+  ): Promise<string> {
+    const end = anchor.line;
+    const isRange = anchor.startLine !== null;
+    const mutation = `mutation($reviewId:ID!,$path:String!,$body:String!,$line:Int!,$side:DiffSide!${
+      isRange ? ",$startLine:Int!,$startSide:DiffSide!" : ""
+    }){
+      addPullRequestReviewThread(input:{
+        pullRequestReviewId:$reviewId, path:$path, body:$body, line:$line, side:$side${
+          isRange ? ", startLine:$startLine, startSide:$startSide" : ""
+        }
+      }){ thread { comments(first:1){ nodes { url } } } }
+    }`;
+    const args = [
+      "api", "graphql",
+      "-f", `query=${mutation}`,
+      "-f", `reviewId=${reviewId}`,
+      "-f", `path=${finding.file}`,
+      "-f", `body=${body}`,
+      "-F", `line=${end}`,
+      "-f", `side=${finding.side}`,
+    ];
+    if (isRange) {
+      args.push("-F", `startLine=${anchor.startLine}`, "-f", `startSide=${finding.side}`);
+    }
+    const raw = await gh(args, 30_000);
+    const parsed = JSON.parse(raw) as {
+      data?: { addPullRequestReviewThread?: { thread?: { comments?: { nodes?: Array<{ url?: unknown }> } } | null } };
+    };
+    const thread = parsed.data?.addPullRequestReviewThread?.thread;
+    if (thread == null) {
+      // GitHub answers with a null thread and no error when it will not place
+      // one — in practice, when this line already has a thread on it.
+      throw new Error(
+        `GitHub would not add a comment at ${finding.file}:${anchor.line}. That usually ` +
+          "means a comment thread already exists there — reply to it on GitHub instead.",
+      );
+    }
+    return String(thread.comments?.nodes?.[0]?.url ?? "");
+  }
+
+  /** The anchor GitHub will accept for a finding, from the reviewed diff. */
+  function postAnchorFor(finding: FindingDto): PostAnchor | null {
+    const stored = getContext(finding.reviewId);
+    if (stored === null) {
+      return resolvePostAnchor(finding, []);
+    }
+    const patch = splitUnifiedDiff(stored.diff).find((file) => file.path === finding.file);
+    return resolvePostAnchor(finding, patch === undefined ? [] : diffHunkRanges(patch.patch, finding.side));
+  }
+
   async function postFinding(
     findingId: string,
-    mode: "inline" | "issue",
+    mode: "inline" | "issue" | "review",
   ): Promise<FindingDto> {
     const row = requireFinding(findingId);
     const finding = toFindingDto(row);
@@ -1092,26 +1310,56 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     const body = effectiveComment(finding);
     if (body.trim() === "") throw new Error("The comment is empty.");
 
-    const inline = mode === "inline" && finding.startLine !== null;
-    const raw = await gh(
-      buildPostCommentArgs({
-        repo: review.repo,
-        number: review.number,
-        body,
-        headSha: inline ? await headSha(review.repo, review.number) : "",
-        file: finding.file,
-        startLine: finding.startLine,
-        endLine: finding.endLine,
-        side: finding.side,
-        mode,
-      }),
-      30_000,
-    );
-    const url = ghField(raw, "html_url");
+    const wantsInline = mode === "inline" || mode === "review";
+    const anchor = wantsInline ? postAnchorFor(finding) : null;
+    if (wantsInline && anchor === null) {
+      throw new Error(
+        `GitHub only accepts an inline comment on a line that is part of the diff, and ` +
+          `${locationOf(finding)} is not. Post it as a general pull request comment instead.`,
+      );
+    }
+    const inline = anchor !== null;
+
+    // A reviewer with a review already open in the GitHub UI cannot have a
+    // standalone comment created; the comment has to join that review.
+    const pending = inline ? await cachedPendingReviewId(review.repo, review.number) : null;
+
+    let url: string;
+    let postedAs: "comment" | "pending-review";
+    if (anchor !== null && (pending !== null || mode === "review")) {
+      // Join the open review when there is one; otherwise open it, so the next
+      // comment — from here or from GitHub — lands in the same draft.
+      url =
+        pending !== null
+          ? await addToPendingReview(pending, finding, anchor, body)
+          : await startPendingReview(review.repo, review.number, finding, anchor, body);
+      postedAs = "pending-review";
+    } else {
+      const raw = await gh(
+        buildPostCommentArgs({
+          repo: review.repo,
+          number: review.number,
+          body,
+          headSha: inline ? await headSha(review.repo, review.number) : "",
+          file: finding.file,
+          startLine: anchor?.startLine ?? anchor?.line ?? null,
+          endLine: anchor?.line ?? null,
+          side: finding.side,
+          mode: mode === "issue" ? "issue" : "inline",
+        }),
+        30_000,
+      );
+      url = ghField(raw, "html_url");
+      postedAs = "comment";
+    }
+
+    // Posting can create the pending review, so the cached answer is stale.
+    pendingReviewCache.delete(reviewIdFor(review.repo, review.number));
 
     db.prepare(
-      `UPDATE findings SET state = 'posted', comment_url = ?, posted_at = ? WHERE id = ?`,
-    ).run(url === "" ? null : url, nowIso(), findingId);
+      `UPDATE findings SET state = 'posted', comment_url = ?, posted_at = ?, posted_as = ?
+       WHERE id = ?`,
+    ).run(url === "" ? null : url, nowIso(), postedAs, findingId);
     announce();
     return toFindingDto(requireFinding(findingId));
   }
@@ -1463,6 +1711,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         pullRequest: pr === null ? null : withReviewState(pr),
         review: review === null ? null : toReviewDto(review),
         findings: review === null ? [] : listFindings(review.id),
+        hasPendingReview: (await cachedPendingReviewId(repo, number)) !== null,
       };
     },
 

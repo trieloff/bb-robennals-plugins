@@ -22,8 +22,28 @@ yourself — one comment at a time, edited how you want it.
    with an agent** in a side tab, or **dismiss it**.
 
 The panel remembers the repo and filter you were on, so re-opening the tab
-resumes where you left off. Nothing reaches GitHub until you press
-*Post comment*. The review agent is told
+resumes where you left off. Nothing reaches GitHub until you press *Post*.
+
+## Sharing a review with the GitHub UI
+
+Reviewing happens across both surfaces — some comments here, some in GitHub's
+own diff view — so they go into the same pending review:
+
+- **A review already open on GitHub**: the button reads *Add to my review* and
+  the comment joins it as a draft, beside the ones you wrote there. GitHub
+  allows only one pending review per person per PR, and refuses standalone
+  comments while one is open, so this is also the only thing that *can* work.
+- **No review open**: *Post comment* publishes immediately, and *Start a
+  review* opens the shared draft instead — the same split GitHub's own UI
+  offers. Later comments, from either surface, join it.
+
+A draft is labelled *Draft comment* and says to submit the review on GitHub to
+publish, because nobody else can see it until you do.
+
+GitHub only anchors an inline comment to a line inside the diff. A finding
+whose range overhangs one is narrowed to the part that is in it, and the panel
+says so; a finding entirely outside the diff can only be a general pull request
+comment, and the panel says that too — before you press the button. The review agent is told
 in as many words not to post, approve, request changes, or touch the PR.
 
 ## Setup
