@@ -7,7 +7,7 @@
 //
 // The panel remembers the repo and filter server-side, so re-opening the tab
 // resumes where it left off instead of asking again.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   definePluginApp,
@@ -215,6 +215,45 @@ function locationLabel(target: {
       ? `${target.startLine}-${target.endLine}`
       : `${target.startLine}`;
   return `${target.file}:${range}`;
+}
+
+/**
+ * Where posting this finding actually puts the comment. GitHub anchors a
+ * multi-line comment at the end of the range, and a finding with no line
+ * anchor can only become a general PR comment — so say which it will be
+ * rather than leaving the reviewer to find out after pressing the button.
+ */
+function postTargetLabel(finding: {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+  side: "LEFT" | "RIGHT";
+}): string {
+  if (finding.startLine === null) {
+    return "as a general comment on the pull request — this issue has no line anchor";
+  }
+  const range =
+    finding.endLine !== null && finding.endLine !== finding.startLine
+      ? `lines ${finding.startLine}–${finding.endLine}`
+      : `line ${finding.startLine}`;
+  const side = finding.side === "LEFT" ? " of the old file" : "";
+  return `on ${finding.file}, ${range}${side}`;
+}
+
+/**
+ * Grow a textarea to fit its content. A suggested comment is usually one long
+ * wrapped paragraph, so counting newlines under-sizes it and clips the text
+ * the reviewer is about to publish.
+ */
+function useAutoSizedTextarea(value: string) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+  useLayoutEffect(() => {
+    const node = ref.current;
+    if (node === null) return;
+    node.style.height = "auto";
+    node.style.height = `${node.scrollHeight}px`;
+  }, [value]);
+  return ref;
 }
 
 /** Refetches on mount and on every server "code-review-changed" signal. */
@@ -871,10 +910,13 @@ function LocationCard({ location }: { location: LocationDto }) {
 function FindingActions({
   rpc,
   finding,
+  diffUrl,
   onDiscuss,
 }: {
   rpc: Rpc;
   finding: FindingDto;
+  /** The finding's own place in the PR diff, when the code has been resolved. */
+  diffUrl?: string;
   onDiscuss: (finding: FindingDto) => void;
 }) {
   const stored = finding.draftComment ?? finding.suggestedComment;
@@ -893,6 +935,8 @@ function FindingActions({
 
   const isDirty = comment !== stored;
   const isPosted = finding.state === "posted";
+  const commentRef = useAutoSizedTextarea(comment);
+  const target = postTargetLabel(finding);
 
   const save = useCallback(
     () =>
@@ -924,7 +968,7 @@ function FindingActions({
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between">
         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Comment to post
+          {isPosted ? "Posted comment" : "Comment to post"}
         </p>
         {isDirty && !isPosted ? (
           <span className="text-xs text-muted-foreground">unsaved edit</span>
@@ -932,19 +976,32 @@ function FindingActions({
           <span className="text-xs text-muted-foreground">edited</span>
         ) : null}
       </div>
+      <p className="-mt-1 text-xs text-muted-foreground">
+        {isPosted ? "Posted " : "Posts "}
+        {diffUrl === undefined || finding.startLine === null ? (
+          <span className="font-mono">{target}</span>
+        ) : (
+          <GithubLink href={diffUrl} className="font-mono underline-offset-4 hover:underline">
+            {target}
+          </GithubLink>
+        )}
+      </p>
       {isPosted ? (
         <div className="whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-2 text-sm">
           {comment}
         </div>
       ) : (
         <Textarea
+          ref={commentRef}
           value={comment}
           onChange={(event) => setComment(event.target.value)}
           onBlur={() => {
             if (isDirty) void save();
           }}
-          rows={Math.min(12, Math.max(3, comment.split("\n").length + 1))}
-          className="text-sm"
+          rows={1}
+          // Height is managed by useAutoSizedTextarea; hide the scrollbar it
+          // would otherwise show while growing.
+          className="resize-none overflow-hidden text-sm"
           aria-label={`Comment for ${finding.title}`}
         />
       )}
@@ -1122,7 +1179,12 @@ function FindingDetailView({
           )}
         </div>
 
-        <FindingActions rpc={rpc} finding={finding} onDiscuss={discuss} />
+        <FindingActions
+          rpc={rpc}
+          finding={finding}
+          diffUrl={locations.find((location) => location.isPrimary)?.diffUrl}
+          onDiscuss={discuss}
+        />
       </div>
 
       <Section

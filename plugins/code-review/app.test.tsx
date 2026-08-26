@@ -563,3 +563,90 @@ describe("remembering the repo when status is slow", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("the comment to post", () => {
+  const detailPath = "pr/acme/app/7/f/f1";
+
+  const withFinding = async (overrides: Partial<FindingDto>) => {
+    const app = await load();
+    return renderSlot(
+      app.navPanels[0]!,
+      { subPath: detailPath },
+      {
+        rpc: rpc({
+          getPullRequest: () => ({
+            pullRequest: PR,
+            review: REVIEW,
+            findings: [{ ...FINDING, ...overrides }],
+          }),
+        }),
+      },
+    );
+  };
+
+  it("says which file and line range the comment lands on", async () => {
+    const slot = await withFinding({});
+    await slot.findByText("on src/a.ts, lines 10–12");
+    slot.lifecycle.unmount();
+  });
+
+  it("says a single line as a line, not a range", async () => {
+    const slot = await withFinding({ startLine: 10, endLine: 10 });
+    await slot.findByText("on src/a.ts, line 10");
+    slot.lifecycle.unmount();
+  });
+
+  it("treats a null endLine as a single line", async () => {
+    const slot = await withFinding({ startLine: 10, endLine: null });
+    await slot.findByText("on src/a.ts, line 10");
+    slot.lifecycle.unmount();
+  });
+
+  it("says when the anchor is on the old side of the diff", async () => {
+    const slot = await withFinding({ side: "LEFT", startLine: 4, endLine: 4 });
+    await slot.findByText("on src/a.ts, line 4 of the old file");
+    slot.lifecycle.unmount();
+  });
+
+  it("warns when the comment can only be a general PR comment", async () => {
+    // Without a line anchor, "Post comment" silently becomes an issue comment;
+    // the reviewer should know that before pressing it.
+    const slot = await withFinding({ startLine: null, endLine: null });
+    await slot.findByText(
+      "as a general comment on the pull request — this issue has no line anchor",
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("links the target to that spot in the PR diff", async () => {
+    const slot = await withFinding({});
+    const link = await slot.findByText("on src/a.ts, lines 10–12");
+    expect(link.closest("a")?.getAttribute("href")).toBe(
+      "https://github.com/acme/app/pull/7/files#diff-abc123R10",
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("says where a posted comment went, in the past tense", async () => {
+    const slot = await withFinding({
+      state: "posted",
+      commentUrl: "https://github.com/acme/app/pull/7#c1",
+    });
+    await slot.findByText("Posted comment");
+    await slot.findByText("on src/a.ts, lines 10–12");
+    slot.lifecycle.unmount();
+  });
+
+  it("lets the box grow to the whole comment instead of clipping it", async () => {
+    // Regression: `rows` was computed from newline count, so a long wrapped
+    // one-paragraph comment — the usual shape — rendered three rows tall.
+    const long = "A very long single-line review comment. ".repeat(30);
+    const slot = await withFinding({ suggestedComment: long, draftComment: null });
+    const box = (await slot.findByLabelText("Comment for Off by one")) as HTMLTextAreaElement;
+    expect(box.value).toBe(long);
+    // Height is driven by content, not by a fixed row count.
+    expect(box.getAttribute("rows")).toBe("1");
+    expect(box.className).toContain("overflow-hidden");
+    slot.lifecycle.unmount();
+  });
+});
