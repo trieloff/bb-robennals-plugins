@@ -22,19 +22,27 @@ import {
   buildDiscussionPrompt,
   buildPostCommentArgs,
   buildReviewPrompt,
+  CLI_OUTPUT_BUDGET,
   FINDINGS_SCHEMA_TEXT,
+  formatContext,
+  formatFileList,
   filterPullRequests,
   isRepoName,
   parseGithubRemote,
   parsePullRequests,
   parseReport,
+  parsePrSnapshot,
   parseRepoList,
+  parseReviewComments,
   parseSkillList,
   PR_JSON_FIELDS,
+  PR_VIEW_JSON_FIELDS,
   severityRank,
   SEVERITIES,
   splitUnifiedDiff,
   type Finding,
+  type FilePatch,
+  type PrSnapshot,
   type PullRequest,
 } from "./review-core";
 
@@ -453,6 +461,15 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
      )`,
     `CREATE INDEX IF NOT EXISTS findings_by_review ON findings (review_id)`,
     `CREATE INDEX IF NOT EXISTS reviews_by_thread ON reviews (thread_id)`,
+    // The PR as fetched when the review started. Held so the review agent
+    // never needs gh or network access of its own, and so its findings' line
+    // numbers refer to one stable diff.
+    `CREATE TABLE IF NOT EXISTS review_context (
+       review_id TEXT PRIMARY KEY,
+       snapshot TEXT NOT NULL,
+       diff TEXT NOT NULL DEFAULT '',
+       fetched_at TEXT NOT NULL
+     )`,
   ]);
 
   function getReview(reviewId: string): ReviewRow | null {
@@ -699,6 +716,57 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   // -------------------------------------------------------------------------
+  // The PR snapshot the review agent reads
+  // -------------------------------------------------------------------------
+  interface ContextRow {
+    snapshot: string;
+    diff: string;
+    fetched_at: string;
+  }
+
+  function getContext(reviewId: string): { snapshot: PrSnapshot; diff: string } | null {
+    const row = db.prepare(`SELECT * FROM review_context WHERE review_id = ?`).get(reviewId) as
+      | ContextRow
+      | undefined;
+    if (row === undefined) return null;
+    return { snapshot: JSON.parse(row.snapshot) as PrSnapshot, diff: row.diff };
+  }
+
+  /**
+   * Fetch the PR once, on the server, and store it. Everything the review
+   * agent needs comes from here, so the agent never runs gh: gh is configured
+   * and unsandboxed here, and may be neither in the agent's environment.
+   */
+  async function fetchContext(repo: string, number: number): Promise<PrSnapshot> {
+    const [viewRaw, diffRaw] = await Promise.all([
+      gh(["pr", "view", String(number), "-R", repo, "--json", PR_VIEW_JSON_FIELDS], 45_000),
+      gh(["pr", "diff", String(number), "-R", repo], 120_000),
+    ]);
+    const snapshot = parsePrSnapshot(viewRaw);
+    // Inline review comments live on a separate endpoint that some repos
+    // refuse; losing them is not worth failing the review over.
+    try {
+      snapshot.reviewComments = parseReviewComments(
+        await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/comments`], 45_000),
+      );
+    } catch (error) {
+      bb.log.warn(`could not fetch review comments for ${repo}#${number}: ${String(error)}`);
+    }
+    db.prepare(
+      `INSERT INTO review_context (review_id, snapshot, diff, fetched_at)
+       VALUES (@review_id, @snapshot, @diff, @fetched_at)
+       ON CONFLICT(review_id) DO UPDATE SET
+         snapshot = @snapshot, diff = @diff, fetched_at = @fetched_at`,
+    ).run({
+      review_id: reviewIdFor(repo, number),
+      snapshot: JSON.stringify(snapshot),
+      diff: diffRaw,
+      fetched_at: nowIso(),
+    });
+    return snapshot;
+  }
+
+  // -------------------------------------------------------------------------
   // Starting a review
   // -------------------------------------------------------------------------
   async function startReview(
@@ -709,10 +777,11 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     requireRepo(repo);
     const config = await settings.get();
     const skills = skillOverride ?? parseSkillList(config.reviewSkills ?? "");
-    const prs = await fetchPullRequests(repo);
-    const pr = prs.find((candidate) => candidate.number === number) ?? null;
-    const title = pr?.title ?? `PR #${number}`;
     const reviewId = reviewIdFor(repo, number);
+    // Fetch the PR up front, on the server. If GitHub is unreachable there is
+    // no point spawning an agent that would have nothing to read.
+    const snapshot = await fetchContext(repo, number);
+    const title = snapshot.title === "" ? `PR #${number}` : snapshot.title;
     const findingsPath = path.posix.join(
       config.findingsDir === "" ? ".bb/code-review" : config.findingsDir,
       `${repo.replace("/", "-")}-${number}.json`,
@@ -753,6 +822,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       findingsPath,
       skills,
       extraInstructions: config.reviewInstructions ?? "",
+      headSha: snapshot.headSha,
     });
     try {
       const thread = await bb.sdk.threads.spawn({
@@ -1069,12 +1139,35 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   // -------------------------------------------------------------------------
   const usage = [
     "Usage:",
+    "  bb code-review context --review <review-id> [--json]",
+    "  bb code-review diff    --review <review-id> [--file <path>]",
+    "  bb code-review files   --review <review-id>",
     "  bb code-review schema",
-    "  bb code-review context --review <review-id>",
-    "  bb code-review submit --review <review-id> --file <path-to-findings.json>",
+    "  bb code-review submit  --review <review-id> --file <path-to-findings.json>",
     "",
-    'A review id looks like "owner/repo#123".',
+    'A review id looks like "owner/repo#123". The PR is fetched when the review',
+    "starts and served from here, so reviewing needs no network access of its own.",
   ].join("\n");
+
+  function unknownReview(reviewId: string): string {
+    return (
+      `No review with id ${reviewId}. Start one from the Code Review panel; ` +
+      "the id is in the prompt that asked for this review."
+    );
+  }
+
+  function noSnapshot(reviewId: string): string {
+    return (
+      `No fetched pull request for ${reviewId}. Re-run the review from the Code ` +
+      "Review panel so the plugin can fetch it again."
+    );
+  }
+
+  /** Trim to the CLI output budget, saying so rather than being rejected. */
+  function clamp(text: string): string {
+    if (Buffer.byteLength(text, "utf8") <= CLI_OUTPUT_BUDGET) return text;
+    return `${text.slice(0, CLI_OUTPUT_BUDGET)}\n\n[truncated — this file's patch is too large to print in full]`;
+  }
 
   function readFlag(argv: string[], name: string): string | null {
     const index = argv.indexOf(`--${name}`);
@@ -1088,14 +1181,25 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     summary: "Report pull request review findings back to the Code Review panel",
     commands: [
       {
+        name: "context",
+        summary:
+          "Print the PR's description, discussion, and changed files (no network needed)",
+        usage: "bb code-review context --review <owner/repo#123> [--json]",
+      },
+      {
+        name: "diff",
+        summary: "Print the PR's diff, or one file of it with --file",
+        usage: "bb code-review diff --review <owner/repo#123> [--file <path>]",
+      },
+      {
+        name: "files",
+        summary: "List the PR's changed files",
+        usage: "bb code-review files --review <owner/repo#123>",
+      },
+      {
         name: "schema",
         summary: "Print the JSON schema a findings file must match",
         usage: "bb code-review schema",
-      },
-      {
-        name: "context",
-        summary: "Print the PR, skills, and findings path for a review",
-        usage: "bb code-review context --review <owner/repo#123>",
       },
       {
         name: "submit",
@@ -1118,10 +1222,58 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           const reviewId = readFlag(argv, "review");
           if (reviewId === null) return { exitCode: 1, stderr: usage };
           const review = getReview(reviewId);
-          if (review === null) {
-            return { exitCode: 1, stderr: `No review with id ${reviewId}.` };
+          if (review === null) return { exitCode: 1, stderr: unknownReview(reviewId) };
+          if (argv.includes("--json")) {
+            return { exitCode: 0, stdout: JSON.stringify(toReviewDto(review), null, 2) };
           }
-          return { exitCode: 0, stdout: JSON.stringify(toReviewDto(review), null, 2) };
+          const context = getContext(reviewId);
+          if (context === null) return { exitCode: 1, stderr: noSnapshot(reviewId) };
+          return { exitCode: 0, stdout: formatContext(reviewId, context.snapshot) };
+        }
+
+        case "files": {
+          const reviewId = readFlag(argv, "review");
+          if (reviewId === null) return { exitCode: 1, stderr: usage };
+          const context = getContext(reviewId);
+          if (context === null) return { exitCode: 1, stderr: noSnapshot(reviewId) };
+          const files = context.snapshot.files;
+          return {
+            exitCode: 0,
+            stdout:
+              files.length === 0
+                ? "This pull request changes no files."
+                : files
+                    .map((file) => `${file.path}  +${file.additions} -${file.deletions}`)
+                    .join("\n"),
+          };
+        }
+
+        case "diff": {
+          const reviewId = readFlag(argv, "review");
+          if (reviewId === null) return { exitCode: 1, stderr: usage };
+          const context = getContext(reviewId);
+          if (context === null) return { exitCode: 1, stderr: noSnapshot(reviewId) };
+          const wanted = readFlag(argv, "file");
+          const patches: FilePatch[] = splitUnifiedDiff(context.diff);
+          if (wanted !== null) {
+            const match = patches.find((file) => file.path === wanted);
+            if (match === undefined) {
+              return {
+                exitCode: 1,
+                stderr: [
+                  `${wanted} is not in this pull request's diff. Changed files:`,
+                  ...patches.map((file) => `  ${file.path}`),
+                ].join("\n"),
+              };
+            }
+            // One pathological file still beats an atomic over-size rejection
+            // that would tell the agent nothing at all.
+            return { exitCode: 0, stdout: clamp(match.patch) };
+          }
+          if (Buffer.byteLength(context.diff, "utf8") > CLI_OUTPUT_BUDGET) {
+            return { exitCode: 0, stdout: formatFileList(reviewId, patches) };
+          }
+          return { exitCode: 0, stdout: context.diff };
         }
 
         case "submit": {
@@ -1130,12 +1282,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           if (reviewId === null || file === null) return { exitCode: 1, stderr: usage };
           const review = getReview(reviewId);
           if (review === null) {
-            return {
-              exitCode: 1,
-              stderr:
-                `No review with id ${reviewId}. Start one from the Code Review panel; ` +
-                "the id is in the prompt that asked for this review.",
-            };
+            return { exitCode: 1, stderr: unknownReview(reviewId) };
           }
           const hostId = await resolveInvokingHostId(ctx.threadId);
           const absolute = path.isAbsolute(file)

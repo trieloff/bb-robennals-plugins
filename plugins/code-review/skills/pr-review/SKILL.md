@@ -12,15 +12,22 @@ comment themselves.
 
 ## The loop
 
-1. **Read the change.**
+1. **Read the change.** The plugin already fetched it — you do **not** need
+   `gh`, and you do not need network access:
 
    ```sh
-   gh pr view <number> -R <owner/repo> --comments
-   gh pr diff <number> -R <owner/repo>
+   bb code-review context --review <owner/repo#123>   # description, discussion, changed files
+   bb code-review diff    --review <owner/repo#123>   # the diff
    ```
 
-   Read the surrounding code too. A diff on its own rarely shows whether a
-   change is correct.
+   The diff is a snapshot pinned to the head commit the review started from, so
+   its line numbers are the ones your findings must use. If the diff is too
+   large to print at once, `diff` says so and lists the files; read them one at
+   a time with `--file <path>`. `bb code-review files --review <id>` lists them
+   with their line counts.
+
+   Read the surrounding code in the checkout too. A diff on its own rarely
+   shows whether a change is correct.
 
 2. **Review it** using whatever skills the prompt named. If it named none,
    review for correctness bugs, missing tests, security problems, and design
@@ -39,8 +46,8 @@ comment themselves.
    bb code-review submit --review <owner/repo#123> --file <path>
    ```
 
-   `bb code-review context --review <owner/repo#123>` reprints the PR, the
-   configured skills, and the findings path if you lose them.
+   `bb code-review context --review <owner/repo#123> --json` reprints the
+   configured skills and the findings path if you lose them.
 
 ## Writing good findings
 
@@ -66,6 +73,9 @@ meaningful result, not a failure.
 
 ## Rules
 
+- **Do not run `gh`.** Everything about the PR is available from
+  `bb code-review`, fetched server-side where GitHub access is configured. The
+  agent sandbox often cannot reach `gh` anyway.
 - **Never post to GitHub yourself**, and never approve or request changes. Every
   comment is reviewed and posted by hand from the panel.
 - **Never modify the PR**, push commits, or edit files in the checkout.

@@ -21,7 +21,8 @@ in as many words not to post, approve, request changes, or touch the PR.
 
 ## Setup
 
-The GitHub CLI is the only transport, so whatever `gh auth` can see, this can:
+The GitHub CLI is the only transport, and it runs server-side, so whatever
+`gh auth` can see on this machine, the plugin can:
 
 ```sh
 gh auth login
@@ -54,16 +55,40 @@ them itself, so the two are separate:
   narrow to a specific one.
 - **All open** — every open PR in the repo.
 
+## The review agent never touches GitHub
+
+When a review starts, the plugin fetches the PR — description, discussion,
+inline review comments, changed files, and the full diff — and stores it. The
+review agent reads that snapshot over the `bb code-review` CLI instead of
+running `gh` itself. Three reasons:
+
+- **The agent sandbox usually cannot reach `gh`.** Its filtering proxy
+  terminates TLS, and `gh` (a Go binary) rejects the interception with
+  `x509: OSStatus -26276`. `curl` and `git` trust it; `gh` does not. The plugin
+  runs in the BB server, which is not sandboxed, so its `gh` always works — and
+  the CLI reaches it over loopback, which the sandbox permits.
+- **The agent's environment may have no `gh` auth at all**, even where the
+  server does.
+- **The snapshot is pinned** to the head commit the review started from, so the
+  line numbers in the findings match the diff the agent actually read, even if
+  the PR moves underneath it.
+
+```sh
+bb code-review context --review owner/repo#123 [--json]  # description, discussion, files
+bb code-review diff    --review owner/repo#123 [--file <path>]
+bb code-review files   --review owner/repo#123
+bb code-review schema                                    # the findings schema
+bb code-review submit  --review owner/repo#123 --file <path>
+```
+
+A diff too large for one CLI response (the host caps a result at 1 MiB and
+rejects an over-large one outright) makes `diff` list the files instead, to be
+read one at a time with `--file`.
+
 ## How findings get in
 
 The review agent writes a JSON file and submits it. That contract is
-documented for agents in `skills/pr-review/SKILL.md`, and the CLI is:
-
-```sh
-bb code-review schema                                    # print the findings schema
-bb code-review context --review owner/repo#123           # the PR, skills, and findings path
-bb code-review submit  --review owner/repo#123 --file <path>
-```
+documented for agents in `skills/pr-review/SKILL.md`.
 
 Each finding carries five things, deliberately kept apart:
 

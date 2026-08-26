@@ -68,6 +68,8 @@ async function makeHost(
   const calls: ShellCall[] = [];
   const spawned: SpawnRecord[] = [];
   const files = options.files ?? {};
+  /** Mutable, so a test can break a gh call after the review has already run. */
+  const failures: Record<string, string> = { ...options.ghFailures };
 
   const gh: Record<string, string> = {
     "--version": "gh version 2.83.1",
@@ -76,7 +78,21 @@ async function makeHost(
     "api user": JSON.stringify({ login: "robennals" }),
     "api --paginate": "acme/core\nacme/infra",
     "pr list": JSON.stringify(options.prs ?? [PR]),
-    "pr view": JSON.stringify({ headRefOid: "sha7" }),
+    "pr view": JSON.stringify({
+      title: "Add a thing",
+      body: "Why this change exists.",
+      author: { login: "dan" },
+      state: "OPEN",
+      isDraft: false,
+      baseRefName: "main",
+      headRefName: "feature",
+      headRefOid: "sha7",
+      comments: [{ author: { login: "kim" }, body: "Looks good.", createdAt: "2026-01-01" }],
+      files: [{ path: "src/a.ts", additions: 3, deletions: 1 }],
+    }),
+    "api --paginate repos": JSON.stringify([
+      { path: "src/a.ts", line: 11, user: { login: "sam" }, body: "off by one" },
+    ]),
     "pr diff":
       "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b",
     "api -X": JSON.stringify({ html_url: "https://github.com/acme/app/pull/7#c1" }),
@@ -117,13 +133,13 @@ async function makeHost(
       calls.push({ file, args });
       if (options.ghMissing === true) throw new Error("spawn gh ENOENT");
       const joined = args.join(" ");
-      const failure = Object.keys(options.ghFailures ?? {}).find((prefix) =>
-        joined.startsWith(prefix),
-      );
+      const failure = Object.keys(failures).find((prefix) => joined.startsWith(prefix));
       if (failure !== undefined) {
-        throw new Error(`gh ${joined} failed: ${options.ghFailures?.[failure]}`);
+        throw new Error(`gh ${joined} failed: ${failures[failure]}`);
       }
-      const key = Object.keys(gh).find((prefix) => joined.startsWith(prefix));
+      const key = Object.keys(gh)
+        .sort((a, b) => b.length - a.length)
+        .find((prefix) => joined.startsWith(prefix));
       if (key === undefined) throw new Error(`unstubbed command: ${file} ${joined}`);
       return { stdout: gh[key] as string, stderr: "" };
     },
@@ -141,7 +157,7 @@ async function makeHost(
   const review = async () =>
     (await call<{ review: ReviewDto }>("getPullRequest", { repo: REPO, number: 7 })).review;
 
-  return { bb, harness, calls, spawned, call, submit, findings, review };
+  return { bb, harness, calls, spawned, failures, call, submit, findings, review };
 }
 
 type Host = Awaited<ReturnType<typeof makeHost>>;
@@ -283,11 +299,11 @@ describe("getPullRequest", () => {
   it("still returns the PR and its findings when the diff cannot be fetched", async () => {
     // An unfetchable diff must not take the findings down with it — the diff
     // is the least important thing on the page.
-    const host = await makeHost({
-      files: { "/w/f.json": report() },
-      ghFailures: { "pr diff": "boom" },
-    });
+    const host = await makeHost({ files: { "/w/f.json": report() } });
     await runReview(host);
+    // The review already has its own fetched snapshot; only browsing the live
+    // diff should be affected.
+    host.failures["pr diff"] = "boom";
     const detail = await host.call<{
       files: unknown[];
       diffError: string | null;
@@ -339,10 +355,14 @@ describe("startReview", () => {
       async runCommand(_file, args) {
         const joined = args.join(" ");
         if (joined.startsWith("pr list")) return { stdout: JSON.stringify([PR]), stderr: "" };
+        if (joined.startsWith("pr view")) {
+          return { stdout: JSON.stringify({ title: "Add a thing", headRefOid: "sha7" }), stderr: "" };
+        }
+        if (joined.startsWith("pr diff")) return { stdout: "", stderr: "" };
         if (joined.startsWith("api user")) {
           return { stdout: JSON.stringify({ login: "robennals" }), stderr: "" };
         }
-        return { stdout: "ok", stderr: "" };
+        return { stdout: "[]", stderr: "" };
       },
     });
     await expect(
@@ -645,9 +665,125 @@ describe("the agent-facing CLI", () => {
   it("prints a review's context for an agent that lost the prompt", async () => {
     const host = await makeHost();
     await host.call("startReview", { repo: REPO, number: 7 });
-    const result = await host.harness.behavior.runCli(["context", "--review", REVIEW_ID]);
+    const result = await host.harness.behavior.runCli([
+      "context", "--review", REVIEW_ID, "--json",
+    ]);
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout ?? "").skills).toEqual(["code-review"]);
+  });
+});
+
+describe("serving the PR to the review agent", () => {
+  it("fetches the PR once, at review start, and serves it without gh", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const ghCallsAfterStart = host.calls.length;
+
+    const context = await host.harness.behavior.runCli(["context", "--review", REVIEW_ID]);
+    const diff = await host.harness.behavior.runCli(["diff", "--review", REVIEW_ID]);
+    const files = await host.harness.behavior.runCli(["files", "--review", REVIEW_ID]);
+
+    expect(context.exitCode, context.stderr).toBe(0);
+    expect(diff.exitCode).toBe(0);
+    expect(files.exitCode).toBe(0);
+    // The whole point: reading the PR costs the agent no GitHub access at all.
+    expect(host.calls.length).toBe(ghCallsAfterStart);
+  });
+
+  it("gives the agent the description, discussion, and inline review comments", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.harness.behavior.runCli(["context", "--review", REVIEW_ID]);
+    expect(result.stdout).toContain("Why this change exists.");
+    expect(result.stdout).toContain("Looks good.");
+    expect(result.stdout).toContain("sam on src/a.ts:11");
+    expect(result.stdout).toContain("Head commit: sha7");
+  });
+
+  it("still starts the review when the repo refuses the review-comments endpoint", async () => {
+    // That endpoint is optional; losing it must not cost the whole review.
+    const host = await makeHost({ ghFailures: { "api --paginate repos": "403" } });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.harness.behavior.runCli(["context", "--review", REVIEW_ID]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("Existing review comments");
+  });
+
+  it("prints the whole diff when it fits", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.harness.behavior.runCli(["diff", "--review", REVIEW_ID]);
+    expect(result.stdout).toContain("diff --git a/src/a.ts b/src/a.ts");
+    expect(result.stdout).toContain("+b");
+  });
+
+  it("pages a diff too large to print, rather than being rejected for size", async () => {
+    // The host rejects an over-budget CLI result atomically, so an unpaged
+    // giant diff would tell the agent nothing at all.
+    const huge = [
+      `diff --git a/big.ts b/big.ts\n+${"x".repeat(900_000)}`,
+      "diff --git a/small.ts b/small.ts\n+ok",
+    ].join("\n");
+    const host = await makeHost({ ghOverrides: { "pr diff": huge } });
+    await host.call("startReview", { repo: REPO, number: 7 });
+
+    const listed = await host.harness.behavior.runCli(["diff", "--review", REVIEW_ID]);
+    expect(listed.exitCode).toBe(0);
+    expect(listed.stdout).toContain("too large");
+    expect(listed.stdout).toContain("--file big.ts");
+    expect(listed.stdout).toContain("--file small.ts");
+
+    const one = await host.harness.behavior.runCli([
+      "diff", "--review", REVIEW_ID, "--file", "small.ts",
+    ]);
+    expect(one.stdout).toContain("+ok");
+    expect(one.stdout).not.toContain("xxxx");
+  });
+
+  it("truncates a single oversized file instead of failing", async () => {
+    const host = await makeHost({
+      ghOverrides: { "pr diff": `diff --git a/big.ts b/big.ts\n+${"x".repeat(900_000)}` },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.harness.behavior.runCli([
+      "diff", "--review", REVIEW_ID, "--file", "big.ts",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[truncated");
+    expect(Buffer.byteLength(result.stdout ?? "", "utf8")).toBeLessThan(1_048_576);
+  });
+
+  it("names the real files when asked for one that is not in the diff", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.harness.behavior.runCli([
+      "diff", "--review", REVIEW_ID, "--file", "nope.ts",
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("not in this pull request's diff");
+    expect(result.stderr).toContain("src/a.ts");
+  });
+
+  it("lists the changed files with their line counts", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.harness.behavior.runCli(["files", "--review", REVIEW_ID]);
+    expect(result.stdout).toContain("src/a.ts  +3 -1");
+  });
+
+  it("tells the agent to re-run the review when there is no snapshot", async () => {
+    const host = await makeHost();
+    const result = await host.harness.behavior.runCli(["diff", "--review", REVIEW_ID]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("Re-run the review");
+  });
+
+  it("refuses to start a review it cannot fetch, instead of spawning a blind agent", async () => {
+    const host = await makeHost({ ghFailures: { "pr diff": "network down" } });
+    await expect(host.call("startReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /network down/,
+    );
+    expect(host.spawned).toHaveLength(0);
   });
 });
 
@@ -668,8 +804,10 @@ describe("registrations", () => {
     }
     expect(harness.registrations.cli?.name).toBe("code-review");
     expect(harness.registrations.cli?.commands?.map((entry) => entry.name)).toEqual([
-      "schema",
       "context",
+      "diff",
+      "files",
+      "schema",
       "submit",
     ]);
     expect(harness.registrations.threadEventHandlers["thread.idle"]).toBe(1);

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPostCommentArgs,
+  formatContext,
+  formatFileList,
+  parsePrSnapshot,
+  parseReviewComments,
   buildReviewPrompt,
   filterPullRequests,
   parsePullRequests,
@@ -124,6 +128,7 @@ describe("buildReviewPrompt", () => {
     findingsPath: ".bb/code-review/acme-app-7.json",
     skills: ["rob-review"],
     extraInstructions: "",
+    headSha: "a804d164384ae76abbb816992b22b0fb4d7cd351",
   };
 
   it("names the review id, path, and every skill", () => {
@@ -134,6 +139,20 @@ describe("buildReviewPrompt", () => {
     expect(prompt).toContain(
       "bb code-review submit --review acme/app#7 --file .bb/code-review/acme-app-7.json",
     );
+  });
+
+  it("sends the agent to the plugin, never to gh", () => {
+    // The agent sandbox cannot reach gh, and the plugin has already fetched
+    // everything — so the prompt must not ask for a network round trip.
+    const prompt = buildReviewPrompt(base);
+    expect(prompt).toContain("bb code-review context --review acme/app#7");
+    expect(prompt).toContain("bb code-review diff --review acme/app#7");
+    expect(prompt).not.toContain("gh pr ");
+    expect(prompt).toContain("you do NOT need `gh`");
+  });
+
+  it("pins the agent to the head commit the diff was fetched at", () => {
+    expect(buildReviewPrompt(base)).toContain("a804d164384a");
   });
 
   it("keeps the blank lines that make it render as Markdown", () => {
@@ -330,5 +349,123 @@ describe("buildPostCommentArgs", () => {
       ...base, body: "line one\nline two", startLine: null, endLine: null, mode: "issue",
     });
     expect(argv).toContain("body=line one\nline two");
+  });
+});
+
+describe("formatContext", () => {
+  const snapshot = {
+    title: "Add a thing",
+    body: "Why this change exists.",
+    author: "dan",
+    state: "OPEN",
+    isDraft: false,
+    baseRefName: "main",
+    headRefName: "feature",
+    headSha: "sha7",
+    comments: [
+      { author: "kim", body: "Looks good to me.", createdAt: "", file: null, line: null },
+    ],
+    reviewComments: [
+      { author: "sam", body: "This bound is off.", createdAt: "", file: "src/a.ts", line: 11 },
+    ],
+    files: [{ path: "src/a.ts", additions: 3, deletions: 1 }],
+  };
+
+  it("gives the agent the description, both kinds of comment, and the file list", () => {
+    const text = formatContext("acme/app#7", snapshot);
+    expect(text).toContain("# acme/app#7 — Add a thing");
+    expect(text).toContain("Why this change exists.");
+    expect(text).toContain("Looks good to me.");
+    // An inline review comment must say where it was left, or it is unusable.
+    expect(text).toContain("sam on src/a.ts:11");
+    expect(text).toContain("This bound is off.");
+    expect(text).toContain("- src/a.ts (+3 −1)");
+    expect(text).toContain("Head commit: sha7");
+  });
+
+  it("says so rather than printing an empty section for a bare PR", () => {
+    const text = formatContext("acme/app#7", {
+      ...snapshot,
+      body: "",
+      comments: [],
+      reviewComments: [],
+      files: [],
+    });
+    expect(text).toContain("(no description)");
+    expect(text).not.toContain("## Discussion");
+    expect(text).not.toContain("## Existing review comments");
+  });
+});
+
+describe("parsePrSnapshot", () => {
+  it("reads gh pr view's shape", () => {
+    const snapshot = parsePrSnapshot(
+      JSON.stringify({
+        title: "Add a thing",
+        body: "b",
+        author: { login: "dan" },
+        state: "OPEN",
+        isDraft: true,
+        baseRefName: "main",
+        headRefName: "feature",
+        headRefOid: "sha7",
+        comments: [{ author: { login: "kim" }, body: "hi", createdAt: "2026-01-01" }],
+        files: [{ path: "src/a.ts", additions: 3, deletions: 1 }],
+      }),
+    );
+    expect(snapshot.author).toBe("dan");
+    expect(snapshot.headSha).toBe("sha7");
+    expect(snapshot.isDraft).toBe(true);
+    expect(snapshot.comments[0]).toEqual({
+      author: "kim",
+      body: "hi",
+      createdAt: "2026-01-01",
+      file: null,
+      line: null,
+    });
+    expect(snapshot.files).toEqual([{ path: "src/a.ts", additions: 3, deletions: 1 }]);
+  });
+
+  it("survives a PR with no body, comments, or files", () => {
+    const snapshot = parsePrSnapshot(JSON.stringify({ title: "t" }));
+    expect(snapshot.body).toBe("");
+    expect(snapshot.comments).toEqual([]);
+    expect(snapshot.files).toEqual([]);
+  });
+});
+
+describe("parseReviewComments", () => {
+  it("reads the REST shape, including the user/login nesting", () => {
+    const comments = parseReviewComments(
+      JSON.stringify([
+        { path: "src/a.ts", line: 11, user: { login: "sam" }, body: "off by one", created_at: "x" },
+      ]),
+    );
+    expect(comments).toEqual([
+      { author: "sam", body: "off by one", createdAt: "x", file: "src/a.ts", line: 11 },
+    ]);
+  });
+
+  it("falls back to original_line for a comment on an outdated diff", () => {
+    const [comment] = parseReviewComments(
+      JSON.stringify([{ path: "src/a.ts", original_line: 4, user: { login: "sam" }, body: "b" }]),
+    );
+    expect(comment?.line).toBe(4);
+  });
+
+  it("returns nothing for a repo that answers with an object", () => {
+    expect(parseReviewComments(JSON.stringify({ message: "Not Found" }))).toEqual([]);
+  });
+});
+
+describe("formatFileList", () => {
+  it("gives one runnable command per file", () => {
+    const text = formatFileList("acme/app#7", [
+      { path: "src/a.ts", patch: "" },
+      { path: "src/b.ts", patch: "" },
+    ]);
+    expect(text).toContain("too large");
+    expect(text).toContain("bb code-review diff --review acme/app#7 --file src/a.ts");
+    expect(text).toContain("bb code-review diff --review acme/app#7 --file src/b.ts");
   });
 });

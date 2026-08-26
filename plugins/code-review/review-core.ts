@@ -198,6 +198,8 @@ export interface ReviewPromptArgs {
   skills: string[];
   /** Free-form extra instructions from plugin settings. */
   extraInstructions: string;
+  /** Head commit the fetched diff is pinned to. */
+  headSha: string;
 }
 
 export function buildReviewPrompt(args: ReviewPromptArgs): string {
@@ -214,10 +216,19 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "",
     "## 1. Read the change",
     "",
-    `    gh pr view ${args.number} -R ${args.repo} --comments`,
-    `    gh pr diff ${args.number} -R ${args.repo}`,
+    "The plugin has already fetched everything from GitHub, so you do NOT need `gh`",
+    "and you do NOT need network access. Read it with:",
     "",
-    "Read the surrounding code too — a diff alone rarely shows whether a change is correct.",
+    `    bb code-review context --review ${args.reviewId}`,
+    `    bb code-review diff --review ${args.reviewId}`,
+    "",
+    `The diff is pinned to the head commit the review started from (${args.headSha.slice(0, 12)}),`,
+    "so its line numbers are the ones your findings should use. If the diff is too",
+    "large to print at once, `diff` says so and lists the files; read them one at a",
+    `time with \`bb code-review diff --review ${args.reviewId} --file <path>\`.`,
+    "",
+    "Read the surrounding code in the checkout too — a diff alone rarely shows whether",
+    "a change is correct.",
     "",
     "## 2. Review it",
     "",
@@ -559,4 +570,194 @@ export function buildPostCommentArgs(args: PostCommentArgs): string[] {
     argv.push("-F", `start_line=${args.startLine}`, "-f", `start_side=${args.side}`);
   }
   return argv;
+}
+
+// ---------------------------------------------------------------------------
+// The fetched PR snapshot
+// ---------------------------------------------------------------------------
+//
+// The plugin fetches the PR once, when a review starts, and serves it to the
+// review agent over the `bb code-review` CLI. That keeps GitHub access on the
+// server — where gh is configured and unsandboxed — and pins the agent to one
+// snapshot, so the line numbers in its findings match the diff it read even if
+// the PR moves underneath it.
+
+/** Combined stdout+stderr must fit PLUGIN_CLI_OUTPUT_MAX_BYTES (1 MiB); the
+ *  host rejects an over-large result atomically rather than clipping it, so
+ *  stay well under and page instead. */
+export const CLI_OUTPUT_BUDGET = 800_000;
+
+export interface PrComment {
+  author: string;
+  body: string;
+  createdAt: string;
+  /** Set for inline review comments. */
+  file: string | null;
+  line: number | null;
+}
+
+export interface ChangedFile {
+  path: string;
+  additions: number;
+  deletions: number;
+}
+
+export interface PrSnapshot {
+  title: string;
+  body: string;
+  author: string;
+  state: string;
+  isDraft: boolean;
+  baseRefName: string;
+  headRefName: string;
+  headSha: string;
+  comments: PrComment[];
+  reviewComments: PrComment[];
+  files: ChangedFile[];
+}
+
+interface GhPrView {
+  title?: unknown;
+  body?: unknown;
+  author?: { login?: unknown } | null;
+  state?: unknown;
+  isDraft?: unknown;
+  baseRefName?: unknown;
+  headRefName?: unknown;
+  headRefOid?: unknown;
+  comments?: Array<Record<string, unknown>> | null;
+  files?: Array<Record<string, unknown>> | null;
+}
+
+/** The `--json` field list `parsePrSnapshot` expects from `gh pr view`. */
+export const PR_VIEW_JSON_FIELDS = [
+  "title",
+  "body",
+  "author",
+  "state",
+  "isDraft",
+  "baseRefName",
+  "headRefName",
+  "headRefOid",
+  "comments",
+  "files",
+].join(",");
+
+function num(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function commentAuthor(row: Record<string, unknown>): string {
+  const author = row.author;
+  if (typeof author === "object" && author !== null) {
+    const login = str((author as Record<string, unknown>).login);
+    if (login !== "") return login;
+  }
+  const user = row.user;
+  if (typeof user === "object" && user !== null) {
+    return str((user as Record<string, unknown>).login);
+  }
+  return "";
+}
+
+export function parsePrSnapshot(raw: string): PrSnapshot {
+  const view = JSON.parse(raw) as GhPrView;
+  return {
+    title: str(view.title),
+    body: str(view.body),
+    author: str(view.author?.login),
+    state: str(view.state),
+    isDraft: view.isDraft === true,
+    baseRefName: str(view.baseRefName),
+    headRefName: str(view.headRefName),
+    headSha: str(view.headRefOid),
+    comments: (view.comments ?? []).map((row) => ({
+      author: commentAuthor(row),
+      body: str(row.body),
+      createdAt: str(row.createdAt),
+      file: null,
+      line: null,
+    })),
+    reviewComments: [],
+    files: (view.files ?? []).map((row) => ({
+      path: str(row.path),
+      additions: num(row.additions),
+      deletions: num(row.deletions),
+    })),
+  };
+}
+
+/**
+ * Inline review comments, from `gh api repos/{o}/{r}/pulls/{n}/comments`. A
+ * repo can refuse this endpoint, so callers treat a failure as "no comments"
+ * rather than failing the whole review.
+ */
+export function parseReviewComments(raw: string): PrComment[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return [];
+  return (parsed as Array<Record<string, unknown>>).map((row) => ({
+    author: commentAuthor(row),
+    body: str(row.body),
+    createdAt: str(row.created_at),
+    file: str(row.path) === "" ? null : str(row.path),
+    line:
+      typeof row.line === "number"
+        ? row.line
+        : typeof row.original_line === "number"
+          ? row.original_line
+          : null,
+  }));
+}
+
+function renderComments(label: string, comments: PrComment[]): string[] {
+  if (comments.length === 0) return [];
+  const lines = [`## ${label}`, ""];
+  for (const comment of comments) {
+    const where = comment.file === null ? "" : ` on ${comment.file}${comment.line === null ? "" : `:${comment.line}`}`;
+    lines.push(`### ${comment.author || "(unknown)"}${where}`, "", comment.body || "(empty)", "");
+  }
+  return lines;
+}
+
+/** The Markdown `bb code-review context` prints for the review agent. */
+export function formatContext(reviewId: string, snapshot: PrSnapshot): string {
+  const totals = snapshot.files.reduce(
+    (acc, file) => ({ add: acc.add + file.additions, del: acc.del + file.deletions }),
+    { add: 0, del: 0 },
+  );
+  return [
+    `# ${reviewId} — ${snapshot.title}`,
+    "",
+    `- Author: ${snapshot.author || "(unknown)"}`,
+    `- State: ${snapshot.state}${snapshot.isDraft ? " (draft)" : ""}`,
+    `- Branch: ${snapshot.headRefName} → ${snapshot.baseRefName}`,
+    `- Head commit: ${snapshot.headSha}`,
+    `- Changes: ${snapshot.files.length} file${snapshot.files.length === 1 ? "" : "s"}, +${totals.add} −${totals.del}`,
+    "",
+    "## Description",
+    "",
+    snapshot.body.trim() === "" ? "(no description)" : snapshot.body,
+    "",
+    ...renderComments("Discussion", snapshot.comments),
+    ...renderComments("Existing review comments", snapshot.reviewComments),
+    "## Changed files",
+    "",
+    ...(snapshot.files.length === 0
+      ? ["(none)"]
+      : snapshot.files.map((file) => `- ${file.path} (+${file.additions} −${file.deletions})`)),
+    "",
+    `Read the diff with \`bb code-review diff --review ${reviewId}\`.`,
+  ].join("\n");
+}
+
+/** The per-file table `diff` prints instead of a diff too large for one call. */
+export function formatFileList(reviewId: string, files: FilePatch[]): string {
+  return [
+    `The diff is too large to print in one call (${files.length} files).`,
+    "Read it one file at a time:",
+    "",
+    ...files.map(
+      (file) => `    bb code-review diff --review ${reviewId} --file ${file.path}`,
+    ),
+  ].join("\n");
 }
