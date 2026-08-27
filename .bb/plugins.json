@@ -3,6 +3,7 @@
   "schemaVersion": 1,
   "name": "robennals-bb-plugins",
   "plugins": [
-    { "name": "code-review", "source": "./plugins/code-review" }
+    { "name": "code-review", "source": "./plugins/code-review" },
+    { "name": "pr-manager", "source": "./plugins/pr-manager" }
   ]
 }
