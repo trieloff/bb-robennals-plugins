@@ -6,14 +6,19 @@ import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
 const statusStyle: Record<PullRequest["status"], string> = {
-  WAITING: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  WAITING: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300",
   FAILING: "border-destructive/30 bg-destructive/10 text-destructive",
   FEEDBACK: "border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300",
   APPROVED: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
   MERGED: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
 };
-function StatusBadge({ status }: { status: PullRequest["status"] }) {
-  return <span className={cn("inline-flex rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide", statusStyle[status])}>{status}</span>;
+function StatusBadge({ status, count }: { status: PullRequest["status"]; count?: number }) {
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide", statusStyle[status])}>
+      <span>{status}</span>
+      {count === undefined ? null : <span className="tabular-nums opacity-80">{count}</span>}
+    </span>
+  );
 }
 function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -79,11 +84,12 @@ function PrManagerPage() {
   const rpc = useRpc<typeof rpcContract>();
   const [prs, setPrs] = useState<PullRequest[] | null>(null);
   const [repositoryFilter, setRepositoryFilter] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<PullRequest["status"] | null>(null);
   const [refreshedAt, setRefreshedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const applyResult = useCallback((result: { prs: PullRequest[]; refreshedAt: string | null }) => {
-    setPrs(result.prs); setRefreshedAt(result.refreshedAt); setError(null);
+  const applyResult = useCallback((result: { prs: PullRequest[]; refreshedAt: string | null; repositoryFilter: string | null }) => {
+    setPrs(result.prs); setRefreshedAt(result.refreshedAt); setRepositoryFilter(result.repositoryFilter); setError(null);
   }, []);
   const loadCached = useCallback(async () => {
     try {
@@ -99,6 +105,15 @@ function PrManagerPage() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setRefreshing(false); }
   }, [applyResult, rpc]);
+  const changeRepository = useCallback(async (repository: string | null) => {
+    setRepositoryFilter(repository);
+    try {
+      await rpc.call("prs_set_repository_filter", { repository });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      void loadCached();
+    }
+  }, [loadCached, rpc]);
   useEffect(() => {
     void loadCached();
   }, [loadCached]);
@@ -114,18 +129,25 @@ function PrManagerPage() {
   }, [prs]);
   useEffect(() => {
     if (repositoryFilter !== null && !repositories.includes(repositoryFilter)) {
-      setRepositoryFilter(null);
+      void changeRepository(null);
     }
-  }, [repositories, repositoryFilter]);
-  const filteredPrs = useMemo(
+  }, [changeRepository, repositories, repositoryFilter]);
+  const repositoryPrs = useMemo(
     () => repositoryFilter === null ? (prs ?? []) : (prs ?? []).filter((pr) => pr.repository === repositoryFilter),
     [prs, repositoryFilter],
   );
   const counts = useMemo(() => {
     const result = new Map<PullRequest["status"], number>();
-    for (const pr of filteredPrs) result.set(pr.status, (result.get(pr.status) ?? 0) + 1);
+    for (const pr of repositoryPrs) result.set(pr.status, (result.get(pr.status) ?? 0) + 1);
     return result;
-  }, [filteredPrs]);
+  }, [repositoryPrs]);
+  useEffect(() => {
+    if (statusFilter !== null && !counts.has(statusFilter)) setStatusFilter(null);
+  }, [counts, statusFilter]);
+  const filteredPrs = useMemo(
+    () => statusFilter === null ? repositoryPrs : repositoryPrs.filter((pr) => pr.status === statusFilter),
+    [repositoryPrs, statusFilter],
+  );
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto box-border w-full max-w-4xl px-4 pb-6 pt-3 md:px-5 md:pt-4">
@@ -135,9 +157,11 @@ function PrManagerPage() {
             <p className="mt-0.5 text-xs text-muted-foreground">
               {prs === null
                 ? "Loading saved status…"
-                : repositoryFilter === null
-                  ? `${prs.length} current and recently merged`
-                  : `${filteredPrs.length} of ${prs.length} current and recently merged`}
+                : statusFilter !== null
+                  ? `${filteredPrs.length} ${statusFilter.toLowerCase()} of ${repositoryPrs.length} shown`
+                  : repositoryFilter === null
+                    ? `${prs.length} current and recently merged`
+                    : `${repositoryPrs.length} of ${prs.length} current and recently merged`}
               {refreshedAt === null ? "" : ` · refreshed ${new Date(refreshedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
             </p>
           </div>
@@ -147,7 +171,7 @@ function PrManagerPage() {
                 <span>Repository</span>
                 <select
                   value={repositoryFilter ?? ""}
-                  onChange={(event) => setRepositoryFilter(event.target.value === "" ? null : event.target.value)}
+                  onChange={(event) => void changeRepository(event.target.value === "" ? null : event.target.value)}
                   className="h-8 max-w-64 rounded-md border border-input bg-background px-2 text-sm text-foreground shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   <option value="">All repositories</option>
@@ -162,14 +186,27 @@ function PrManagerPage() {
         </div>
         {prs !== null && prs.length > 0 ? (
           <div className="mt-3 flex flex-wrap gap-1.5">{[...counts.entries()].map(([status, count]) =>
-            <span key={status} className="text-xs text-muted-foreground"><StatusBadge status={status} /> <span className="ml-0.5">{count}</span></span>)}</div>
+            <button
+              key={status}
+              type="button"
+              aria-pressed={statusFilter === status}
+              aria-label={`${statusFilter === status ? "Clear" : "Filter by"} ${status.toLowerCase()} status, ${count} pull requests`}
+              onClick={() => setStatusFilter((current) => current === status ? null : status)}
+              className={cn(
+                "inline-flex items-center rounded-full text-xs text-muted-foreground outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                statusFilter !== null && statusFilter !== status && "opacity-50",
+                statusFilter === status && "ring-2 ring-ring ring-offset-2 ring-offset-background",
+              )}
+            >
+              <StatusBadge status={status} count={count} />
+            </button>)}</div>
         ) : null}
         {error === null ? null : <div role="alert" className="mt-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>}
         <div className="mt-4 space-y-2.5">
           {prs === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">Loading your saved pull request list…</div>
           : refreshedAt === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No saved pull request list yet. Click Refresh to load it.</div>
           : prs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No open or recently merged pull requests.</div>
-          : filteredPrs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No pull requests in this repository.</div>
+          : filteredPrs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No pull requests match these filters.</div>
           : filteredPrs.map((pr) => <PullRequestRow key={pr.key} pr={pr} onChanged={() => void loadCached()} />)}
         </div>
       </div>

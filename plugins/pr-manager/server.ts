@@ -12,12 +12,20 @@ const pullRequestSchema = z.object({
 });
 export type PullRequest = z.infer<typeof pullRequestSchema>;
 
-const pullRequestListSchema = z.object({ prs: z.array(pullRequestSchema), refreshedAt: z.string().nullable() });
+const repositoryFilterSchema = z.string().min(1).nullable();
+const pullRequestListSchema = z.object({
+  prs: z.array(pullRequestSchema), refreshedAt: z.string().nullable(),
+  repositoryFilter: repositoryFilterSchema.default(null),
+});
 type PullRequestList = z.infer<typeof pullRequestListSchema>;
 
 export const rpcContract = defineRpcContract({
   prs_list: { input: z.null(), output: pullRequestListSchema },
   prs_refresh: { input: z.null(), output: pullRequestListSchema },
+  prs_set_repository_filter: {
+    input: z.object({ repository: repositoryFilterSchema }),
+    output: z.object({ repositoryFilter: repositoryFilterSchema }),
+  },
   prs_create_thread: {
     input: z.object({
       repository: z.string(), number: z.number().int().positive(), title: z.string(),
@@ -60,12 +68,12 @@ export default async function plugin(bb: BbPluginApi) {
   async function readCachedPullRequests(): Promise<PullRequestList> {
     const cached = await bb.storage.kv.get<unknown>(PR_LIST_CACHE_KEY);
     const parsed = pullRequestListSchema.safeParse(cached);
-    return parsed.success ? parsed.data : { prs: [], refreshedAt: null };
+    return parsed.success ? parsed.data : { prs: [], refreshedAt: null, repositoryFilter: null };
   }
 
   async function refreshPullRequests(): Promise<PullRequestList> {
-    const [{ mergedWithinDays, maximumPullRequests }, hosts, context] = await Promise.all([
-      settings.get(), bb.sdk.hosts.list(), projectAndThreadContext(),
+    const [{ mergedWithinDays, maximumPullRequests }, hosts, context, cached] = await Promise.all([
+      settings.get(), bb.sdk.hosts.list(), projectAndThreadContext(), readCachedPullRequests(),
     ]);
     const connected = hosts.filter((candidate) => candidate.status === "connected");
     if (connected.length === 0) throw new Error("No connected BB machine is available.");
@@ -106,7 +114,10 @@ export default async function plugin(bb: BbPluginApi) {
         threadTitle: thread?.title ?? thread?.titleFallback ?? null,
       });
     }
-    const result = { prs, refreshedAt: new Date().toISOString() };
+    const repositoryFilter = cached.repositoryFilter !== null && prs.some((pr) => pr.repository === cached.repositoryFilter)
+      ? cached.repositoryFilter
+      : null;
+    const result = { prs, refreshedAt: new Date().toISOString(), repositoryFilter };
     await bb.storage.kv.set(PR_LIST_CACHE_KEY, result);
     return result;
   }
@@ -114,6 +125,14 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     prs_list: () => readCachedPullRequests(),
     prs_refresh: () => refreshPullRequests(),
+    prs_set_repository_filter: async ({ repository }) => {
+      const cached = await readCachedPullRequests();
+      if (repository !== null && !cached.prs.some((pr) => pr.repository === repository)) {
+        throw new Error("That repository is not in the saved pull request list.");
+      }
+      await bb.storage.kv.set(PR_LIST_CACHE_KEY, { ...cached, repositoryFilter: repository });
+      return { repositoryFilter: repository };
+    },
     prs_create_thread: async (input) => {
       const projects = await bb.sdk.projects.list();
       const project = projects.find((candidate) => candidate.id === input.projectId);
