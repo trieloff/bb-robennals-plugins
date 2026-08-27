@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildFileContextBlock,
   buildPostCommentArgs,
+  githubBlobUrl,
   formatContext,
   formatFileList,
   parsePrSnapshot,
@@ -665,5 +667,84 @@ describe("resolvePostAnchor", () => {
       startLine: 5,
       adjusted: false,
     });
+  });
+});
+
+describe("buildFileContextBlock", () => {
+  const base = {
+    file: "e2e-tests/fixtures/account.ts",
+    blobUrl: "https://github.com/o/r/blob/sha/e2e-tests/fixtures/account.ts#L59",
+    firstLine: 57,
+    lines: ["        }", "", "        await expect(menu).toContainText(key);", "    }"],
+  };
+
+  it("links the location and quotes only the cited line", () => {
+    const block = buildFileContextBlock({ ...base, startLine: 59, endLine: 59 });
+    expect(block).toBe(
+      "[`e2e-tests/fixtures/account.ts:59`](https://github.com/o/r/blob/sha/e2e-tests/fixtures/account.ts#L59)\n" +
+        "\n```ts\n        await expect(menu).toContainText(key);\n```",
+    );
+  });
+
+  it("quotes a whole range and labels it as one", () => {
+    const block = buildFileContextBlock({ ...base, startLine: 58, endLine: 59 });
+    expect(block).toContain("`e2e-tests/fixtures/account.ts:58-59`");
+    expect(block).toContain("\n\n        await expect(menu).toContainText(key);\n```");
+  });
+
+  it("uses the file extension as the fence language", () => {
+    expect(buildFileContextBlock({ ...base, file: "a/b.py", startLine: 59, endLine: 59 })).toContain(
+      "```py",
+    );
+    // An implausible extension must not become a bogus language tag.
+    expect(
+      buildFileContextBlock({ ...base, file: "Makefile", startLine: 59, endLine: 59 }),
+    ).toContain("```\n");
+  });
+
+  it("falls back to just the link when there is no code", () => {
+    expect(buildFileContextBlock({ ...base, startLine: 59, endLine: 59, lines: [] })).toBe(
+      "[`e2e-tests/fixtures/account.ts:59`](https://github.com/o/r/blob/sha/e2e-tests/fixtures/account.ts#L59)",
+    );
+  });
+
+  it("falls back to just the link when there is no line anchor", () => {
+    const block = buildFileContextBlock({ ...base, startLine: null, endLine: null });
+    expect(block).toBe(
+      "[`e2e-tests/fixtures/account.ts`](https://github.com/o/r/blob/sha/e2e-tests/fixtures/account.ts#L59)",
+    );
+  });
+
+  it("does not run past the end of the window it was given", () => {
+    const block = buildFileContextBlock({ ...base, startLine: 59, endLine: 200 });
+    expect(block.split("\n").filter((line) => line.startsWith("        ")).length).toBeLessThan(4);
+  });
+});
+
+describe("githubBlobUrl", () => {
+  const base = { repo: "o/r", sha: "abc123", file: "src/a b.ts" };
+
+  it("highlights a single line", () => {
+    expect(githubBlobUrl({ ...base, startLine: 5, endLine: 5 })).toBe(
+      "https://github.com/o/r/blob/abc123/src/a%20b.ts#L5",
+    );
+  });
+
+  it("highlights a range", () => {
+    expect(githubBlobUrl({ ...base, startLine: 5, endLine: 9 })).toBe(
+      "https://github.com/o/r/blob/abc123/src/a%20b.ts#L5-L9",
+    );
+  });
+
+  it("omits the fragment with no line", () => {
+    expect(githubBlobUrl({ ...base, startLine: null, endLine: null })).toBe(
+      "https://github.com/o/r/blob/abc123/src/a%20b.ts",
+    );
+  });
+
+  it("keeps directory separators unencoded", () => {
+    expect(githubBlobUrl({ ...base, file: "a/b/c.ts", startLine: null, endLine: null })).toContain(
+      "/blob/abc123/a/b/c.ts",
+    );
   });
 });

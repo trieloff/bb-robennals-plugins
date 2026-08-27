@@ -91,6 +91,9 @@ const CODE = {
       note: "",
       isPrimary: true,
       diffUrl: "https://github.com/acme/app/pull/7/files#diff-abc123R10",
+      blobUrl: "https://github.com/acme/app/blob/sha7/src/a.ts#L10-L12",
+      contextBlock:
+        "[`src/a.ts:10-12`](https://github.com/acme/app/blob/sha7/src/a.ts#L10-L12)\n\n```ts\nconst x = 1;\n```",
       firstLine: 9,
       lines: ["line nine", "const x = 1;", "const y = 2;", "const z = 3;", "line thirteen"],
       hasMoreAbove: true,
@@ -104,6 +107,8 @@ const CODE = {
       note: "the pattern this should match",
       isPrimary: false,
       diffUrl: "https://github.com/acme/app/pull/7/files#diff-def456R20",
+      blobUrl: "https://github.com/acme/app/blob/sha7/src/other.ts#L20",
+      contextBlock: "[`src/other.ts:20`](https://github.com/acme/app/blob/sha7/src/other.ts#L20)",
       firstLine: 20,
       lines: ["retry(() => run());"],
       hasMoreAbove: true,
@@ -726,6 +731,85 @@ describe("a comment added to a pending review", () => {
     );
     await slot.findByText("Posted comment");
     expect(slot.queryByText(/Submit that review on GitHub/)).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("a comment that cannot be anchored to a line", () => {
+  const noAnchor = { startLine: null, endLine: null, postAnchor: null } as Partial<FindingDto>;
+
+  const render = async () => {
+    const app = await load();
+    return renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7/f/f1" },
+      {
+        rpc: rpc({
+          getPullRequest: () => ({
+            pullRequest: PR,
+            review: REVIEW,
+            findings: [{ ...FINDING, ...noAnchor }],
+            hasPendingReview: false,
+          }),
+        }),
+      },
+    );
+  };
+
+  it("offers to carry the file link and the quoted lines into the comment", async () => {
+    // A general comment lands at the bottom of the conversation with no code
+    // beside it, so a comment about a line reads as a non-sequitur.
+    const slot = await render();
+    await slot.findByText(/no code next to it/);
+    await slot.findByText("Add the file link and quoted lines");
+    slot.lifecycle.unmount();
+  });
+
+  it("puts the link and quote at the top of the editable comment", async () => {
+    const slot = await render();
+    const button = await slot.findByText("Add the file link and quoted lines");
+    fireEvent.click(button.closest("button") ?? button);
+    const box = (await slot.findByLabelText("Comment for Off by one")) as HTMLTextAreaElement;
+    await waitFor(() => {
+      expect(box.value).toContain(
+        "[`src/a.ts:10-12`](https://github.com/acme/app/blob/sha7/src/a.ts#L10-L12)",
+      );
+    });
+    expect(box.value).toContain("```ts");
+    // The original comment survives, below the context.
+    expect(box.value).toContain("Please fix the bound here.");
+    expect(box.value.indexOf("src/a.ts:10-12")).toBeLessThan(
+      box.value.indexOf("Please fix the bound here."),
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("saves the comment so the context is not lost on navigation", async () => {
+    const slot = await render();
+    const button = await slot.findByText("Add the file link and quoted lines");
+    fireEvent.click(button.closest("button") ?? button);
+    await waitFor(() => {
+      const saved = slot.inspection.rpcCalls.find((entry) => entry.method === "setFindingComment");
+      expect((saved?.input as { comment: string })?.comment).toContain("blob/sha7");
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("stops offering once the context is in the comment", async () => {
+    const slot = await render();
+    const button = await slot.findByText("Add the file link and quoted lines");
+    fireEvent.click(button.closest("button") ?? button);
+    await waitFor(() => {
+      expect(slot.queryByText("Add the file link and quoted lines")).toBeNull();
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("does not offer it when the comment can be anchored", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    await slot.findByLabelText("Comment for Off by one");
+    expect(slot.queryByText("Add the file link and quoted lines")).toBeNull();
     slot.lifecycle.unmount();
   });
 });

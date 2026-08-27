@@ -57,6 +57,9 @@ interface LocationDto {
   note: string;
   isPrimary: boolean;
   diffUrl: string;
+  blobUrl: string;
+  /** Markdown quoting this location, for a comment that cannot be anchored. */
+  contextBlock: string;
   firstLine: number;
   lines: string[];
   hasMoreAbove: boolean;
@@ -922,6 +925,7 @@ function FindingActions({
   rpc,
   finding,
   diffUrl,
+  primaryLocation,
   hasPendingReview,
   onDiscuss,
 }: {
@@ -929,6 +933,8 @@ function FindingActions({
   finding: FindingDto;
   /** The finding's own place in the PR diff, when the code has been resolved. */
   diffUrl?: string;
+  /** The finding's own code, for quoting into a general comment. */
+  primaryLocation?: LocationDto;
   /** The reviewer already has an unsubmitted review open on this PR. */
   hasPendingReview: boolean;
   onDiscuss: (finding: FindingDto) => void;
@@ -952,6 +958,15 @@ function FindingActions({
   const commentRef = useAutoSizedTextarea(comment);
   const target = postTargetLabel(finding);
   const onlyGeneralComment = finding.postAnchor === null;
+  // A general comment lands at the bottom of the conversation with no code
+  // beside it, so a comment written about a line needs to carry its own
+  // context. Offered rather than applied: the body is posted verbatim, and
+  // that stays true only if what is in the box is all there is.
+  const contextBlock =
+    onlyGeneralComment && primaryLocation !== undefined && primaryLocation.contextBlock !== ""
+      ? primaryLocation.contextBlock
+      : null;
+  const hasContext = contextBlock !== null && comment.includes(contextBlock);
   // A comment added to an unsubmitted review is a draft: nobody else can see
   // it until the review is submitted on GitHub.
   const isDraft = isPosted && finding.postedAs === "pending-review";
@@ -1007,6 +1022,29 @@ function FindingActions({
       {target.note === null ? null : (
         <p className="-mt-1 text-xs text-muted-foreground/80">{target.note}</p>
       )}
+      {!isPosted && contextBlock !== null && !hasContext ? (
+        <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+          <p className="text-xs text-muted-foreground">
+            A general comment appears at the bottom of the pull request with no code next to it.
+            Add a link to the file and the lines this is about, so it reads on its own.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 w-fit gap-1.5 text-xs"
+            onClick={() => {
+              const next = `${contextBlock}\n\n${comment}`;
+              setComment(next);
+              rpc
+                .call("setFindingComment", { findingId: finding.id, comment: next })
+                .then(() => undefined, reportError);
+            }}
+          >
+            <Icon name="Code" className="size-3.5" />
+            Add the file link and quoted lines
+          </Button>
+        </div>
+      ) : null}
       {!isPosted && hasPendingReview && !onlyGeneralComment ? (
         <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
           You have a review open on this pull request, so this joins it as a draft alongside the
@@ -1234,6 +1272,7 @@ function FindingDetailView({
           rpc={rpc}
           finding={finding}
           diffUrl={locations.find((location) => location.isPrimary)?.diffUrl}
+          primaryLocation={locations.find((location) => location.isPrimary)}
           hasPendingReview={pr.data?.hasPendingReview ?? false}
           onDiscuss={discuss}
         />

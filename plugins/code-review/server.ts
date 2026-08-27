@@ -28,6 +28,8 @@ import {
   findingLocations,
   formatContext,
   formatFileList,
+  buildFileContextBlock,
+  githubBlobUrl,
   githubPrFileUrl,
   githubPrUrl,
   citationCandidates,
@@ -189,6 +191,13 @@ const codeLocationSchema = z.object({
   isPrimary: z.boolean(),
   /** The PR's diff for this file, anchored at the cited line. */
   diffUrl: z.string(),
+  /** The file at the reviewed commit, with the lines highlighted. */
+  blobUrl: z.string(),
+  /**
+   * Markdown quoting this location with a link, for a comment that cannot be
+   * anchored to a line. Empty when the code could not be read.
+   */
+  contextBlock: z.string(),
   /** First line number in `lines`; 1-based. */
   firstLine: z.number(),
   lines: z.array(z.string()),
@@ -1584,7 +1593,21 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           line: location.startLine,
           side: finding.side,
         });
-        const base = { ...location, diffUrl, firstLine: 1, lines: [] as string[] };
+        const blobUrl = githubBlobUrl({
+          repo: review.repo,
+          sha,
+          file: location.file,
+          startLine: location.startLine,
+          endLine: location.endLine,
+        });
+        const base = {
+          ...location,
+          diffUrl,
+          blobUrl,
+          contextBlock: "",
+          firstLine: 1,
+          lines: [] as string[],
+        };
         if (sha === "") {
           return {
             ...base,
@@ -1616,10 +1639,19 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         const end = location.endLine ?? start;
         const from = Math.max(1, start - contextLines);
         const to = Math.min(all.length, end + contextLines);
+        const lines = all.slice(from - 1, to);
         return {
           ...base,
           firstLine: from,
-          lines: all.slice(from - 1, to),
+          lines,
+          contextBlock: buildFileContextBlock({
+            file: location.file,
+            startLine: location.startLine,
+            endLine: location.endLine,
+            blobUrl,
+            lines,
+            firstLine: from,
+          }),
           hasMoreAbove: from > 1,
           hasMoreBelow: to < all.length,
           error: null,

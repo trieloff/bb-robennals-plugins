@@ -955,6 +955,28 @@ export function findingGist(finding: { summary?: string; problem: string }): str
 // GitHub deep links
 // ---------------------------------------------------------------------------
 
+/**
+ * A permalink to a file at a commit, with the lines highlighted.
+ *
+ * Used for lines outside the diff, where a PR-diff anchor scrolls nowhere:
+ * the blob view always shows the code, at the exact commit reviewed.
+ */
+export function githubBlobUrl(args: {
+  repo: string;
+  sha: string;
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+}): string {
+  const path = args.file.split("/").map(encodeURIComponent).join("/");
+  const base = `https://github.com/${args.repo}/blob/${args.sha}/${path}`;
+  if (args.startLine === null) return base;
+  const end = args.endLine;
+  return end !== null && end !== args.startLine
+    ? `${base}#L${args.startLine}-L${end}`
+    : `${base}#L${args.startLine}`;
+}
+
 export function githubPrUrl(repo: string, number: number): string {
   return `https://github.com/${repo}/pull/${number}`;
 }
@@ -1242,4 +1264,47 @@ export function resolvePostAnchor(
     startLine: contiguousStart < line ? contiguousStart : null,
     adjusted: line !== wanted.end || contiguousStart !== wanted.start,
   };
+}
+
+/**
+ * A quoted excerpt with a link, to prepend to a comment that cannot be
+ * anchored to a line.
+ *
+ * A general pull request comment appears at the bottom of the conversation
+ * with no code beside it, so a comment written about a specific line reads as
+ * a non-sequitur. Carrying the code and a permalink into the body is the only
+ * way to keep it legible.
+ */
+export function buildFileContextBlock(args: {
+  file: string;
+  startLine: number | null;
+  endLine: number | null;
+  blobUrl: string;
+  /** The window fetched for the panel, starting at `firstLine`. */
+  lines: readonly string[];
+  firstLine: number;
+}): string {
+  const label =
+    args.startLine === null
+      ? args.file
+      : args.endLine !== null && args.endLine !== args.startLine
+        ? `${args.file}:${args.startLine}-${args.endLine}`
+        : `${args.file}:${args.startLine}`;
+  const link = `[\`${label}\`](${args.blobUrl})`;
+  if (args.startLine === null || args.lines.length === 0) return link;
+
+  // Quote only the cited lines; the surrounding context the panel shows is
+  // there for the reviewer, not for the pull request.
+  const from = Math.max(0, args.startLine - args.firstLine);
+  const to = Math.max(from, (args.endLine ?? args.startLine) - args.firstLine);
+  const quoted = args.lines.slice(from, to + 1);
+  if (quoted.length === 0) return link;
+
+  // Only a real extension: "Makefile" has no dot, and taking its whole name
+  // as the fence language is nonsense.
+  const name = args.file.split("/").pop() ?? "";
+  const dot = name.lastIndexOf(".");
+  const extension = dot > 0 ? name.slice(dot + 1) : "";
+  const language = /^[A-Za-z0-9]{1,10}$/.test(extension) ? extension.toLowerCase() : "";
+  return [link, "", `\`\`\`${language}`, ...quoted, "\`\`\`"].join("\n");
 }
