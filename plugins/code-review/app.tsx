@@ -1510,7 +1510,8 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: PANEL_ID,
     title: "Code Review",
-    icon: "GitPullRequest",
+    // Only a fallback: the manifest icon asset wins on compact surfaces.
+    icon: "Search",
     path: PANEL_PATH,
     component: CodeReviewPanel,
     fixedTabs: [

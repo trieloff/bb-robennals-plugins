@@ -10,7 +10,7 @@
     "name": "Code Review",
     "description": "List PRs awaiting your review, run your review skills on one, and post the findings comment by comment.",
     "branding": {
-      "icon": "GitPullRequest"
+      "icon": "./assets/icon.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx"
