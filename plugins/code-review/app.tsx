@@ -892,11 +892,6 @@ function LocationCard({ location }: { location: LocationDto }) {
         >
           {locationLabel(location)}
         </GithubLink>
-        {location.isPrimary ? (
-          <Badge variant="outline" className="shrink-0 border-border text-[10px]">
-            this issue
-          </Badge>
-        ) : null}
         <GithubLink
           href={location.diffUrl}
           className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline-offset-4 hover:underline"
@@ -1234,12 +1229,30 @@ function FindingDetailView({
   }
 
   const locations: LocationDto[] = code.data?.locations ?? [];
+  const primary = locations.find((location) => location.isPrimary);
+  const others = locations.filter((location) => !location.isPrimary);
   const nextContext = CONTEXT_STEPS[contextStep + 1];
+  const isStale = code.data !== null && !code.data.isReviewedCommit && locations.length > 0;
+
+  const contextButton =
+    locations.length === 0 ? null : (
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 text-xs"
+        onClick={() => setContextStep((step) => (step + 1) % CONTEXT_STEPS.length)}
+      >
+        {nextContext === undefined ? "Less context" : `More context (±${nextContext})`}
+      </Button>
+    );
 
   return (
     <div className="flex flex-col gap-4">
       <BackButton onBack={onBack} label="All issues" />
 
+      {/* The decision unit: what is wrong, the code it is about, and the
+          comment to post about it — in that order, so the comment is read
+          against the code rather than from memory. */}
       <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-3">
         <div className="flex items-start gap-2">
           <SeverityBadge severity={finding.severity} />
@@ -1268,55 +1281,53 @@ function FindingDetailView({
           )}
         </div>
 
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              {finding.postAnchor === null ? "Code this issue is about" : "Code the comment attaches to"}
+            </p>
+            {contextButton}
+          </div>
+          {isStale ? (
+            <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              This code is the pull request&apos;s current head, not the commit the review ran
+              against — that commit was not recorded. Line numbers may have moved since the issue
+              was written.
+            </p>
+          ) : null}
+          {code.error !== null ? (
+            <EmptyState icon="AlertTriangle" title="Could not load the code" detail={code.error} />
+          ) : code.isLoading && code.data === null ? (
+            <Skeleton className="h-32 w-full rounded-lg" />
+          ) : primary === undefined ? (
+            <EmptyState icon="Code" title="No code to show" detail="This issue cites no file." />
+          ) : (
+            <LocationCard location={primary} />
+          )}
+        </div>
+
         <FindingActions
           rpc={rpc}
           finding={finding}
-          diffUrl={locations.find((location) => location.isPrimary)?.diffUrl}
-          primaryLocation={locations.find((location) => location.isPrimary)}
+          diffUrl={primary?.diffUrl}
+          primaryLocation={primary}
           hasPendingReview={pr.data?.hasPendingReview ?? false}
           onDiscuss={discuss}
         />
       </div>
 
-      <Section
-        title={`Code${locations.length > 0 ? ` (${locations.length})` : ""}`}
-        action={
-          locations.length === 0 ? null : (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 text-xs"
-              onClick={() => setContextStep((step) => (step + 1) % CONTEXT_STEPS.length)}
-            >
-              {nextContext === undefined ? "Less context" : `More context (±${nextContext})`}
-            </Button>
-          )
-        }
-      >
-        {code.data !== null && !code.data.isReviewedCommit && locations.length > 0 ? (
-          <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-            This code is the pull request&apos;s current head, not the commit the review ran
-            against — that commit was not recorded. Line numbers may have moved since the issue
-            was written.
-          </p>
-        ) : null}
-        {code.error !== null ? (
-          <EmptyState icon="AlertTriangle" title="Could not load the code" detail={code.error} />
-        ) : code.isLoading && code.data === null ? (
-          <Skeleton className="h-40 w-full rounded-lg" />
-        ) : locations.length === 0 ? (
-          <EmptyState icon="Code" title="No code to show" detail="This issue cites no file." />
-        ) : (
+      {others.length === 0 ? null : (
+        <Section title={`Other code this issue points at (${others.length})`}>
           <div className="flex flex-col gap-3">
-            {locations.map((location) => (
+            {others.map((location) => (
               <LocationCard
                 key={`${location.file}:${location.startLine ?? ""}`}
                 location={location}
               />
             ))}
           </div>
-        )}
-      </Section>
+        </Section>
+      )}
     </div>
   );
 }

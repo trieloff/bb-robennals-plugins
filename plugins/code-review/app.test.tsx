@@ -813,3 +813,88 @@ describe("a comment that cannot be anchored to a line", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("the order of an issue view", () => {
+  /** True when `a` appears before `b` in the document. */
+  const isBefore = (a: Element, b: Element) =>
+    (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  it("puts the code the comment attaches to above the comment itself", async () => {
+    // The comment has to be read against the code, not from memory.
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    const code = await slot.findByText("const x = 1;");
+    const box = await slot.findByLabelText("Comment for Off by one");
+    expect(isBefore(code, box)).toBe(true);
+    slot.lifecycle.unmount();
+  });
+
+  it("puts the other referenced code below the comment", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    const box = await slot.findByLabelText("Comment for Off by one");
+    const other = await slot.findByText("src/other.ts:20");
+    expect(isBefore(box, other)).toBe(true);
+    slot.lifecycle.unmount();
+  });
+
+  it("separates the attached code from the supporting code", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    await slot.findByText("Code the comment attaches to");
+    await slot.findByText("Other code this issue points at (1)");
+    slot.lifecycle.unmount();
+  });
+
+  it("says the code is what the issue is about when nothing can be attached", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7/f/f1" },
+      {
+        rpc: rpc({
+          getPullRequest: () => ({
+            pullRequest: PR,
+            review: REVIEW,
+            findings: [{ ...FINDING, startLine: null, endLine: null, postAnchor: null }],
+            hasPendingReview: false,
+          }),
+        }),
+      },
+    );
+    await slot.findByText("Code this issue is about");
+    expect(slot.queryByText("Code the comment attaches to")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("omits the supporting section when the issue cites one place", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7/f/f1" },
+      { rpc: rpc({ getFindingCode: () => ({ ...CODE, locations: [CODE.locations[0]] }) }) },
+    );
+    await slot.findByText("const x = 1;");
+    expect(slot.queryByText(/Other code this issue points at/)).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("still shows the comment when the code cannot be loaded", async () => {
+    // Losing the snippet must not cost the reviewer the comment.
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "pr/acme/app/7/f/f1" },
+      {
+        rpc: rpc({
+          getFindingCode: () => {
+            throw new Error("boom");
+          },
+        }),
+      },
+    );
+    await slot.findByText("Could not load the code");
+    await slot.findByLabelText("Comment for Off by one");
+    slot.lifecycle.unmount();
+  });
+});
