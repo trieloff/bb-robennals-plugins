@@ -313,7 +313,7 @@ describe("buildPostCommentArgs", () => {
 
   it("anchors a multi-line finding with start_line before line", () => {
     const argv = buildPostCommentArgs({
-      ...base, startLine: 10, endLine: 12, mode: "inline",
+      ...base, startLine: 10, endLine: 12, kind: "line",
     });
     expect(argv).toContain("repos/acme/app/pulls/7/comments");
     // `line` is the LAST line of the range; `start_line` the first.
@@ -325,35 +325,49 @@ describe("buildPostCommentArgs", () => {
 
   it("omits start_line for a single line, which GitHub rejects otherwise", () => {
     const argv = buildPostCommentArgs({
-      ...base, startLine: 10, endLine: 10, mode: "inline",
+      ...base, startLine: 10, endLine: 10, kind: "line",
     });
     expect(argv).toContain("line=10");
     expect(argv.some((arg) => arg.startsWith("start_line="))).toBe(false);
   });
 
   it("treats a null endLine as a single line", () => {
-    const argv = buildPostCommentArgs({ ...base, startLine: 4, endLine: null, mode: "inline" });
+    const argv = buildPostCommentArgs({ ...base, startLine: 4, endLine: null, kind: "line" });
     expect(argv).toContain("line=4");
     expect(argv.some((arg) => arg.startsWith("start_line="))).toBe(false);
   });
 
-  it("falls back to an issue comment when there is no line anchor", () => {
+  it("attaches to the file when there is no line anchor", () => {
+    // GitHub takes a file-level comment for any file in the pull request, and
+    // shows it against that file rather than at the bottom of the thread.
     const argv = buildPostCommentArgs({
-      ...base, startLine: null, endLine: null, mode: "inline",
+      ...base, startLine: null, endLine: null, kind: "line",
+    });
+    expect(argv).toContain("repos/acme/app/pulls/7/comments");
+    expect(argv).toContain("subject_type=file");
+    expect(argv).toContain("path=src/a.ts");
+    expect(argv.some((arg) => arg.startsWith("line="))).toBe(false);
+  });
+
+  it("attaches to the file when asked to, even with line anchors", () => {
+    const argv = buildPostCommentArgs({ ...base, startLine: 10, endLine: 12, kind: "file" });
+    expect(argv).toContain("subject_type=file");
+    expect(argv).toContain("repos/acme/app/pulls/7/comments");
+    expect(argv.some((arg) => arg.startsWith("line="))).toBe(false);
+  });
+
+  it("uses a plain pull request comment only when asked", () => {
+    const argv = buildPostCommentArgs({
+      ...base, startLine: 10, endLine: 12, kind: "pull-request",
     });
     expect(argv).toContain("repos/acme/app/issues/7/comments");
     expect(argv.some((arg) => arg.startsWith("path="))).toBe(false);
   });
 
-  it("honours an explicit issue-comment request even with line anchors", () => {
-    const argv = buildPostCommentArgs({ ...base, startLine: 10, endLine: 12, mode: "issue" });
-    expect(argv).toContain("repos/acme/app/issues/7/comments");
-    expect(argv).toContain("body=Please fix this.");
-  });
 
   it("passes the body as a single -f argument so newlines survive", () => {
     const argv = buildPostCommentArgs({
-      ...base, body: "line one\nline two", startLine: null, endLine: null, mode: "issue",
+      ...base, body: "line one\nline two", startLine: null, endLine: null, kind: "pull-request",
     });
     expect(argv).toContain("body=line one\nline two");
   });
@@ -625,12 +639,17 @@ describe("resolvePostAnchor", () => {
   ];
 
   it("narrows a range that overhangs the diff to the part inside it", () => {
-    const anchor = resolvePostAnchor({ startLine: 137, endLine: 139 }, ranges);
-    expect(anchor).toEqual({ line: 137, startLine: null, adjusted: true });
+    expect(resolvePostAnchor({ startLine: 137, endLine: 139 }, ranges)).toEqual({
+      kind: "line",
+      line: 137,
+      startLine: null,
+      adjusted: true,
+    });
   });
 
   it("keeps a range that fits entirely inside a hunk", () => {
     expect(resolvePostAnchor({ startLine: 130, endLine: 135 }, ranges)).toEqual({
+      kind: "line",
       line: 135,
       startLine: 130,
       adjusted: false,
@@ -639,6 +658,7 @@ describe("resolvePostAnchor", () => {
 
   it("anchors a single line without a start", () => {
     expect(resolvePostAnchor({ startLine: 130, endLine: 130 }, ranges)).toEqual({
+      kind: "line",
       line: 130,
       startLine: null,
       adjusted: false,
@@ -653,16 +673,33 @@ describe("resolvePostAnchor", () => {
     expect(anchor?.adjusted).toBe(true);
   });
 
-  it("gives up when no part of the range is in the diff", () => {
-    expect(resolvePostAnchor({ startLine: 200, endLine: 210 }, ranges)).toBeNull();
+  it("falls back to the file when no part of the range is in the diff", () => {
+    // GitHub refuses a line outside a hunk even when the file is in the diff,
+    // so the file itself is the closest place the comment can go.
+    expect(resolvePostAnchor({ startLine: 200, endLine: 210 }, ranges)).toEqual({
+      kind: "file",
+      line: null,
+      startLine: null,
+      adjusted: false,
+    });
   });
 
-  it("gives up when the finding has no line anchor", () => {
-    expect(resolvePostAnchor({ startLine: null, endLine: null }, ranges)).toBeNull();
+  it("falls back to the file when the finding has no line anchor", () => {
+    expect(resolvePostAnchor({ startLine: null, endLine: null }, ranges).kind).toBe("file");
+  });
+
+  it("falls back to the pull request only when the file is not in it", () => {
+    expect(resolvePostAnchor({ startLine: 200, endLine: 210 }, ranges, false).kind).toBe(
+      "pull-request",
+    );
+    expect(resolvePostAnchor({ startLine: null, endLine: null }, [], false).kind).toBe(
+      "pull-request",
+    );
   });
 
   it("trusts the finding when the diff is unknown", () => {
     expect(resolvePostAnchor({ startLine: 5, endLine: 8 }, [])).toEqual({
+      kind: "line",
       line: 8,
       startLine: 5,
       adjusted: false,

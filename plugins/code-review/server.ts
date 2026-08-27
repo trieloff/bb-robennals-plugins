@@ -127,18 +127,17 @@ const findingSchemaDto = z.object({
   /** "pending-review" means it is a draft in the user's unsubmitted review. */
   postedAs: z.enum(["comment", "pending-review"]),
   /**
-   * Where an inline comment can actually be anchored, given the diff. Null
-   * when no part of the finding's range is in the diff, so only a general
-   * pull request comment is possible.
+   * How this comment can be attached, given the diff.
    */
-  postAnchor: z
-    .object({
-      line: z.number(),
-      startLine: z.number().nullable(),
-      /** The finding's range had to be narrowed to fit the diff. */
-      adjusted: z.boolean(),
-    })
-    .nullable(),
+  postAnchor: z.object({
+    /** "line" anchors to the code; "file" attaches to the file in the diff;
+     *  "pull-request" is a plain comment, for a file the PR does not touch. */
+    kind: z.enum(["line", "file", "pull-request"]),
+    line: z.number().nullable(),
+    startLine: z.number().nullable(),
+    /** The finding's range had to be narrowed to fit the diff. */
+    adjusted: z.boolean(),
+  }),
   discussionThreadId: z.string().nullable(),
   references: z.array(
     z.object({
@@ -465,8 +464,8 @@ function toFindingDto(row: FindingRow): FindingDto {
     postedAs: row.posted_as === "pending-review" ? "pending-review" : "comment",
     discussionThreadId: row.discussion_thread_id,
     references: parseJsonArray(row.references_json),
-    // Filled in by listFindings, which has the diff to hand.
-    postAnchor: null,
+    // Replaced by listFindings, which has the diff to hand.
+    postAnchor: { kind: "file" as const, line: null, startLine: null, adjusted: false },
   };
 }
 
@@ -680,6 +679,9 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         postAnchor: resolvePostAnchor(
           finding,
           patch === undefined ? [] : diffHunkRanges(patch.patch, finding.side),
+          // With no stored diff we cannot tell, so assume the file is in it and
+          // let GitHub have the final say.
+          stored === null || patch !== undefined,
         ),
       };
     });
@@ -1216,7 +1218,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   ): Promise<string> {
     const comment: Record<string, unknown> = {
       path: finding.file,
-      line: anchor.line,
+      line: anchor.line ?? 1,
       side: finding.side,
       body,
     };
@@ -1256,7 +1258,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     anchor: PostAnchor,
     body: string,
   ): Promise<string> {
-    const end = anchor.line;
+    const end = anchor.line ?? 0;
     const isRange = anchor.startLine !== null;
     const mutation = `mutation($reviewId:ID!,$path:String!,$body:String!,$line:Int!,$side:DiffSide!${
       isRange ? ",$startLine:Int!,$startSide:DiffSide!" : ""
@@ -1296,13 +1298,15 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   /** The anchor GitHub will accept for a finding, from the reviewed diff. */
-  function postAnchorFor(finding: FindingDto): PostAnchor | null {
+  function postAnchorFor(finding: FindingDto): PostAnchor {
     const stored = getContext(finding.reviewId);
-    if (stored === null) {
-      return resolvePostAnchor(finding, []);
-    }
+    if (stored === null) return resolvePostAnchor(finding, [], true);
     const patch = splitUnifiedDiff(stored.diff).find((file) => file.path === finding.file);
-    return resolvePostAnchor(finding, patch === undefined ? [] : diffHunkRanges(patch.patch, finding.side));
+    return resolvePostAnchor(
+      finding,
+      patch === undefined ? [] : diffHunkRanges(patch.patch, finding.side),
+      patch !== undefined,
+    );
   }
 
   async function postFinding(
@@ -1319,23 +1323,20 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     const body = effectiveComment(finding);
     if (body.trim() === "") throw new Error("The comment is empty.");
 
-    const wantsInline = mode === "inline" || mode === "review";
-    const anchor = wantsInline ? postAnchorFor(finding) : null;
-    if (wantsInline && anchor === null) {
-      throw new Error(
-        `GitHub only accepts an inline comment on a line that is part of the diff, and ` +
-          `${locationOf(finding)} is not. Post it as a general pull request comment instead.`,
-      );
-    }
-    const inline = anchor !== null;
+    // "issue" is an explicit request for a plain pull request comment; anything
+    // else takes the best placement the diff allows.
+    const anchor = mode === "issue"
+      ? { kind: "pull-request" as const, line: null, startLine: null, adjusted: false }
+      : postAnchorFor(finding);
+    const attachable = anchor.kind !== "pull-request";
 
     // A reviewer with a review already open in the GitHub UI cannot have a
     // standalone comment created; the comment has to join that review.
-    const pending = inline ? await cachedPendingReviewId(review.repo, review.number) : null;
+    const pending = attachable ? await cachedPendingReviewId(review.repo, review.number) : null;
 
     let url: string;
     let postedAs: "comment" | "pending-review";
-    if (anchor !== null && (pending !== null || mode === "review")) {
+    if (anchor.kind === "line" && (pending !== null || mode === "review")) {
       // Join the open review when there is one; otherwise open it, so the next
       // comment — from here or from GitHub — lands in the same draft.
       url =
@@ -1349,12 +1350,12 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           repo: review.repo,
           number: review.number,
           body,
-          headSha: inline ? await headSha(review.repo, review.number) : "",
+          headSha: attachable ? await headSha(review.repo, review.number) : "",
           file: finding.file,
-          startLine: anchor?.startLine ?? anchor?.line ?? null,
-          endLine: anchor?.line ?? null,
+          startLine: anchor.startLine ?? anchor.line,
+          endLine: anchor.line,
           side: finding.side,
-          mode: mode === "issue" ? "issue" : "inline",
+          kind: anchor.kind,
         }),
         30_000,
       );

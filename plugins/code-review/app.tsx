@@ -227,19 +227,21 @@ function locationLabel(target: {
  * rather than leaving the reviewer to find out after pressing the button.
  */
 function postTargetLabel(finding: FindingDto): { text: string; note: string | null } {
-  if (finding.startLine === null) {
+  const anchor = finding.postAnchor;
+  if (anchor.kind === "pull-request") {
     return {
-      text: "as a general comment on the pull request",
-      note: "This issue has no line anchor, so it cannot be an inline comment.",
+      text: "as a comment on the pull request",
+      note: "This pull request does not touch that file, so the comment cannot be attached to it.",
     };
   }
-  const anchor = finding.postAnchor;
-  if (anchor === null) {
+  if (anchor.kind === "file") {
     return {
-      text: "as a general comment on the pull request",
+      text: `on the file ${finding.file}`,
       note:
-        `GitHub only accepts inline comments on lines that are part of the diff, and ` +
-        `${locationLabel(finding)} is not.`,
+        finding.startLine === null
+          ? "This issue names no line, so the comment attaches to the file."
+          : `GitHub anchors comments only to lines inside the diff, and ${locationLabel(finding)} ` +
+            "is not one, so the comment attaches to the file instead.",
     };
   }
   const range =
@@ -952,16 +954,20 @@ function FindingActions({
   const isPosted = finding.state === "posted";
   const commentRef = useAutoSizedTextarea(comment);
   const target = postTargetLabel(finding);
-  const onlyGeneralComment = finding.postAnchor === null;
+  const attachesToFile = finding.postAnchor.kind !== "line";
   // A general comment lands at the bottom of the conversation with no code
   // beside it, so a comment written about a line needs to carry its own
   // context. Offered rather than applied: the body is posted verbatim, and
   // that stays true only if what is in the box is all there is.
+  // A comment that is not anchored to the lines has to carry them, or it reads
+  // as a remark about nothing. Added automatically rather than offered: there
+  // is no case where the reviewer wants the contextless version.
   const contextBlock =
-    onlyGeneralComment && primaryLocation !== undefined && primaryLocation.contextBlock !== ""
+    attachesToFile && primaryLocation !== undefined && primaryLocation.contextBlock !== ""
       ? primaryLocation.contextBlock
       : null;
   const hasContext = contextBlock !== null && comment.includes(contextBlock);
+  const bodyToPost = contextBlock !== null && !hasContext ? `${contextBlock}\n\n${comment}` : comment;
   // A comment added to an unsubmitted review is a draft: nobody else can see
   // it until the review is submitted on GitHub.
   const isDraft = isPosted && finding.postedAs === "pending-review";
@@ -978,7 +984,12 @@ function FindingActions({
     async (mode: "inline" | "issue" | "review") => {
       setIsBusy(true);
       try {
-        if (isDirty) await save();
+        // Persist exactly what is posted, so the record matches GitHub.
+        if (isDirty || bodyToPost !== stored) {
+          await rpc
+            .call("setFindingComment", { findingId: finding.id, comment: bodyToPost })
+            .then(() => undefined, reportError);
+        }
         await rpc.call("postFinding", { findingId: finding.id, mode });
         toast.success("Comment posted");
         setInlineFailed(false);
@@ -989,7 +1000,7 @@ function FindingActions({
         setIsBusy(false);
       }
     },
-    [rpc, finding.id, isDirty, save],
+    [rpc, finding.id, isDirty, stored, bodyToPost],
   );
 
   return (
@@ -1006,7 +1017,7 @@ function FindingActions({
       </div>
       <p className="-mt-1 text-xs text-muted-foreground">
         {isPosted ? (isDraft ? "Drafted " : "Posted ") : "Posts "}
-        {diffUrl === undefined || onlyGeneralComment ? (
+        {diffUrl === undefined || attachesToFile ? (
           <span className="font-mono">{target.text}</span>
         ) : (
           <GithubLink href={diffUrl} className="font-mono underline-offset-4 hover:underline">
@@ -1018,29 +1029,14 @@ function FindingActions({
         <p className="-mt-1 text-xs text-muted-foreground/80">{target.note}</p>
       )}
       {!isPosted && contextBlock !== null && !hasContext ? (
-        <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
-          <p className="text-xs text-muted-foreground">
-            A general comment appears at the bottom of the pull request with no code next to it.
-            Add a link to the file and the lines this is about, so it reads on its own.
-          </p>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 w-fit gap-1.5 text-xs"
-            onClick={() => {
-              const next = `${contextBlock}\n\n${comment}`;
-              setComment(next);
-              rpc
-                .call("setFindingComment", { findingId: finding.id, comment: next })
-                .then(() => undefined, reportError);
-            }}
-          >
-            <Icon name="Code" className="size-3.5" />
-            Add the file link and quoted lines
-          </Button>
-        </div>
+        <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          The lines this is about are not shown beside a {finding.postAnchor.kind === "file"
+            ? "file"
+            : "pull request"}{" "}
+          comment, so a link and the code will be added above your text when you post.
+        </p>
       ) : null}
-      {!isPosted && hasPendingReview && !onlyGeneralComment ? (
+      {!isPosted && hasPendingReview && !attachesToFile ? (
         <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
           You have a review open on this pull request, so this joins it as a draft alongside the
           comments you made on GitHub. Submit that review on GitHub to publish them together.
@@ -1089,11 +1085,13 @@ function FindingActions({
               size="sm"
               className="h-8 gap-1.5 text-xs"
               disabled={isBusy || comment.trim() === ""}
-              onClick={() => void post(onlyGeneralComment ? "issue" : "inline")}
+              onClick={() => void post(attachesToFile ? "issue" : "inline")}
             >
               <Icon name="Sent" className="size-3.5" />
-              {onlyGeneralComment
-                ? "Post as a general comment"
+              {attachesToFile
+                ? finding.postAnchor.kind === "file"
+                  ? "Comment on the file"
+                  : "Comment on the pull request"
                 : hasPendingReview
                   ? "Add to my review"
                   : "Post comment"}
@@ -1101,7 +1099,7 @@ function FindingActions({
             {/* Mirrors GitHub's own split: publish now, or batch into a review.
                 With a review already open, GitHub allows only the batched form,
                 so the single button above already does that. */}
-            {!onlyGeneralComment && !hasPendingReview ? (
+            {!attachesToFile && !hasPendingReview ? (
               <Button
                 size="sm"
                 variant="outline"
@@ -1112,7 +1110,7 @@ function FindingActions({
                 Start a review
               </Button>
             ) : null}
-            {inlineFailed && !onlyGeneralComment ? (
+            {inlineFailed && !attachesToFile ? (
               <Button
                 size="sm"
                 variant="outline"
@@ -1284,7 +1282,9 @@ function FindingDetailView({
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              {finding.postAnchor === null ? "Code this issue is about" : "Code the comment attaches to"}
+              {finding.postAnchor.kind === "line"
+                ? "Code the comment attaches to"
+                : "Code this issue is about"}
             </p>
             {contextButton}
           </div>

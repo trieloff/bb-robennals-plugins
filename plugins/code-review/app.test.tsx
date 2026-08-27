@@ -76,7 +76,7 @@ const FINDING: FindingDto = {
   commentUrl: null,
   postedAt: null,
   postedAs: "comment",
-  postAnchor: { line: 12, startLine: 10, adjusted: false },
+  postAnchor: { kind: "line" as const, line: 12, startLine: 10, adjusted: false },
   discussionThreadId: null,
   references: [],
 };
@@ -611,7 +611,7 @@ describe("the comment to post", () => {
     const slot = await withFinding({
       startLine: 10,
       endLine: 10,
-      postAnchor: { line: 10, startLine: null, adjusted: false },
+      postAnchor: { kind: "line" as const, line: 10, startLine: null, adjusted: false },
     });
     await slot.findByText("on src/a.ts, line 10");
     slot.lifecycle.unmount();
@@ -621,7 +621,7 @@ describe("the comment to post", () => {
     const slot = await withFinding({
       startLine: 10,
       endLine: null,
-      postAnchor: { line: 10, startLine: null, adjusted: false },
+      postAnchor: { kind: "line" as const, line: 10, startLine: null, adjusted: false },
     });
     await slot.findByText("on src/a.ts, line 10");
     slot.lifecycle.unmount();
@@ -632,18 +632,20 @@ describe("the comment to post", () => {
       side: "LEFT",
       startLine: 4,
       endLine: 4,
-      postAnchor: { line: 4, startLine: null, adjusted: false },
+      postAnchor: { kind: "line" as const, line: 4, startLine: null, adjusted: false },
     });
     await slot.findByText("on src/a.ts, line 4 of the old file");
     slot.lifecycle.unmount();
   });
 
-  it("warns when the comment can only be a general PR comment", async () => {
-    // Without a line anchor, "Post comment" silently becomes an issue comment;
-    // the reviewer should know that before pressing it.
-    const slot = await withFinding({ startLine: null, endLine: null, postAnchor: null });
-    await slot.findByText("as a general comment on the pull request");
-    await slot.findByText(/no line anchor/);
+  it("says it attaches to the file when the issue names no line", async () => {
+    const slot = await withFinding({
+      startLine: null,
+      endLine: null,
+      postAnchor: { kind: "file", line: null, startLine: null, adjusted: false },
+    });
+    await slot.findByText("on the file src/a.ts");
+    await slot.findByText(/names no line/);
     slot.lifecycle.unmount();
   });
 
@@ -736,9 +738,16 @@ describe("a comment added to a pending review", () => {
 });
 
 describe("a comment that cannot be anchored to a line", () => {
-  const noAnchor = { startLine: null, endLine: null, postAnchor: null } as Partial<FindingDto>;
+  // GitHub refuses a line comment outside a diff hunk (verified against the
+  // API: the last line of a hunk is accepted, the next line is not), so the
+  // comment attaches to the file and has to carry the lines itself.
+  const toFile = {
+    startLine: 59,
+    endLine: 59,
+    postAnchor: { kind: "file", line: null, startLine: null, adjusted: false },
+  } as Partial<FindingDto>;
 
-  const render = async () => {
+  const render = async (overrides: Partial<FindingDto> = toFile) => {
     const app = await load();
     return renderSlot(
       app.navPanels[0]!,
@@ -748,7 +757,7 @@ describe("a comment that cannot be anchored to a line", () => {
           getPullRequest: () => ({
             pullRequest: PR,
             review: REVIEW,
-            findings: [{ ...FINDING, ...noAnchor }],
+            findings: [{ ...FINDING, ...overrides }],
             hasPendingReview: false,
           }),
         }),
@@ -756,60 +765,54 @@ describe("a comment that cannot be anchored to a line", () => {
     );
   };
 
-  it("offers to carry the file link and the quoted lines into the comment", async () => {
-    // A general comment lands at the bottom of the conversation with no code
-    // beside it, so a comment about a line reads as a non-sequitur.
+  it("says it will attach to the file, and why", async () => {
     const slot = await render();
-    await slot.findByText(/no code next to it/);
-    await slot.findByText("Add the file link and quoted lines");
+    await slot.findByText("on the file src/a.ts");
+    await slot.findByText(/anchors comments only to lines inside the diff/);
     slot.lifecycle.unmount();
   });
 
-  it("puts the link and quote at the top of the editable comment", async () => {
+  it("labels the button as a comment on the file", async () => {
     const slot = await render();
-    const button = await slot.findByText("Add the file link and quoted lines");
-    fireEvent.click(button.closest("button") ?? button);
-    const box = (await slot.findByLabelText("Comment for Off by one")) as HTMLTextAreaElement;
-    await waitFor(() => {
-      expect(box.value).toContain(
-        "[`src/a.ts:10-12`](https://github.com/acme/app/blob/sha7/src/a.ts#L10-L12)",
-      );
-    });
-    expect(box.value).toContain("```ts");
-    // The original comment survives, below the context.
-    expect(box.value).toContain("Please fix the bound here.");
-    expect(box.value.indexOf("src/a.ts:10-12")).toBeLessThan(
-      box.value.indexOf("Please fix the bound here."),
-    );
+    await slot.findByText("Comment on the file");
     slot.lifecycle.unmount();
   });
 
-  it("saves the comment so the context is not lost on navigation", async () => {
+  it("says the code will be carried into the comment", async () => {
     const slot = await render();
-    const button = await slot.findByText("Add the file link and quoted lines");
+    await slot.findByText(/a link and the code will be added above your text/);
+    slot.lifecycle.unmount();
+  });
+
+  it("posts the link and quoted lines above the comment, without being asked", async () => {
+    // Nobody wants the contextless version, so this is not a button.
+    const slot = await render();
+    const button = await slot.findByText("Comment on the file");
     fireEvent.click(button.closest("button") ?? button);
     await waitFor(() => {
       const saved = slot.inspection.rpcCalls.find((entry) => entry.method === "setFindingComment");
-      expect((saved?.input as { comment: string })?.comment).toContain("blob/sha7");
+      const body = (saved?.input as { comment: string } | undefined)?.comment ?? "";
+      expect(body).toContain("[`src/a.ts:10-12`](https://github.com/acme/app/blob/sha7/src/a.ts");
+      expect(body).toContain("```ts");
+      expect(body.indexOf("blob/sha7")).toBeLessThan(body.indexOf("Please fix the bound here."));
     });
     slot.lifecycle.unmount();
   });
 
-  it("stops offering once the context is in the comment", async () => {
-    const slot = await render();
-    const button = await slot.findByText("Add the file link and quoted lines");
-    fireEvent.click(button.closest("button") ?? button);
-    await waitFor(() => {
-      expect(slot.queryByText("Add the file link and quoted lines")).toBeNull();
+  it("says it will be a plain pull request comment when the file is not in the diff", async () => {
+    const slot = await render({
+      postAnchor: { kind: "pull-request", line: null, startLine: null, adjusted: false },
     });
+    await slot.findByText("as a comment on the pull request");
+    await slot.findByText(/does not touch that file/);
     slot.lifecycle.unmount();
   });
 
-  it("does not offer it when the comment can be anchored", async () => {
+  it("does not add context when the comment anchors to the lines", async () => {
     const app = await load();
     const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
     await slot.findByLabelText("Comment for Off by one");
-    expect(slot.queryByText("Add the file link and quoted lines")).toBeNull();
+    expect(slot.queryByText(/will be added above your text/)).toBeNull();
     slot.lifecycle.unmount();
   });
 });
@@ -856,7 +859,12 @@ describe("the order of an issue view", () => {
           getPullRequest: () => ({
             pullRequest: PR,
             review: REVIEW,
-            findings: [{ ...FINDING, startLine: null, endLine: null, postAnchor: null }],
+            findings: [{
+              ...FINDING,
+              startLine: null,
+              endLine: null,
+              postAnchor: { kind: "file" as const, line: null, startLine: null, adjusted: false },
+            }],
             hasPendingReview: false,
           }),
         }),

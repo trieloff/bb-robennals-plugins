@@ -589,7 +589,7 @@ export interface PostCommentArgs {
   startLine: number | null;
   endLine: number | null;
   side: "LEFT" | "RIGHT";
-  mode: "inline" | "issue";
+  kind: PostKind;
 }
 
 /**
@@ -600,11 +600,23 @@ export interface PostCommentArgs {
  * to a plain PR comment.
  */
 export function buildPostCommentArgs(args: PostCommentArgs): string[] {
-  if (args.mode === "issue" || args.startLine === null) {
+  if (args.kind === "pull-request") {
     return [
       "api", "-X", "POST",
       `repos/${args.repo}/issues/${args.number}/comments`,
       "-f", `body=${args.body}`,
+    ];
+  }
+  // A file-level comment: GitHub accepts it for any file the PR touches, and
+  // shows it against that file rather than at the bottom of the conversation.
+  if (args.kind === "file" || args.startLine === null) {
+    return [
+      "api", "-X", "POST",
+      `repos/${args.repo}/pulls/${args.number}/comments`,
+      "-f", `body=${args.body}`,
+      "-f", `commit_id=${args.headSha}`,
+      "-f", `path=${args.file}`,
+      "-f", "subject_type=file",
     ];
   }
   const end = args.endLine ?? args.startLine;
@@ -1214,9 +1226,22 @@ function inAnyRange(line: number, ranges: readonly LineRange[]): boolean {
   return ranges.some((range) => line >= range.start && line <= range.end);
 }
 
+/**
+ * How a comment can be attached, best first.
+ *
+ * - `line`: anchored to the lines, which GitHub allows only inside a diff hunk.
+ * - `file`: attached to the file in the diff view. GitHub accepts this for any
+ *   file in the pull request, which is most findings whose lines fall outside
+ *   a hunk — much better placement than the bottom of the conversation.
+ * - `pull-request`: a plain comment, the only option for a file the pull
+ *   request does not touch.
+ */
+export type PostKind = "line" | "file" | "pull-request";
+
 export interface PostAnchor {
-  /** The line GitHub will anchor the comment to (the end of the range). */
-  line: number;
+  kind: PostKind;
+  /** The line GitHub will anchor to; null for file and pull-request comments. */
+  line: number | null;
   /** Start of a multi-line comment, or null for a single-line one. */
   startLine: number | null;
   /** True when the finding's own range had to be narrowed to fit the diff. */
@@ -1224,7 +1249,7 @@ export interface PostAnchor {
 }
 
 /**
- * The anchor GitHub will accept for a finding, or null when none will do.
+ * The best attachment GitHub will accept for a finding.
  *
  * A finding's range is about the code, so it often overhangs the diff — the
  * range 137-139 against hunks ending at 137 is rejected outright, because
@@ -1234,12 +1259,19 @@ export interface PostAnchor {
 export function resolvePostAnchor(
   finding: { startLine: number | null; endLine: number | null },
   ranges: readonly LineRange[],
-): PostAnchor | null {
-  if (finding.startLine === null) return null;
+  /** Whether the pull request touches this file at all. */
+  fileInDiff = true,
+): PostAnchor {
+  const fallback: PostAnchor = fileInDiff
+    ? { kind: "file", line: null, startLine: null, adjusted: false }
+    : { kind: "pull-request", line: null, startLine: null, adjusted: false };
+  if (finding.startLine === null) return fallback;
   // With no diff to check against, trust the finding and let GitHub rule.
   if (ranges.length === 0) {
+    if (!fileInDiff) return fallback;
     const end = finding.endLine ?? finding.startLine;
     return {
+      kind: "line",
       line: end,
       startLine: end > finding.startLine ? finding.startLine : null,
       adjusted: false,
@@ -1250,7 +1282,7 @@ export function resolvePostAnchor(
   for (let line = wanted.start; line <= wanted.end; line += 1) {
     if (inAnyRange(line, ranges)) covered.push(line);
   }
-  if (covered.length === 0) return null;
+  if (covered.length === 0) return fallback;
   const line = covered[covered.length - 1] as number;
   const start = covered[0] as number;
   // A comment range must sit inside one hunk, so only span back as far as the
@@ -1260,6 +1292,7 @@ export function resolvePostAnchor(
     contiguousStart -= 1;
   }
   return {
+    kind: "line",
     line,
     startLine: contiguousStart < line ? contiguousStart : null,
     adjusted: line !== wanted.end || contiguousStart !== wanted.start,
