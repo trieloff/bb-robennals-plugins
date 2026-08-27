@@ -464,15 +464,23 @@ export function parsePullRequests(raw: string, repo: string): PullRequest[] {
 }
 
 export type PrFilter =
+  // Careful: "mine" means a review was requested from you, while "authored"
+  // means you opened it. They are different lists and neither implies the
+  // other.
   | { kind: "all" }
   | { kind: "mine" }
   | { kind: "my-teams" }
-  | { kind: "team"; teamSlug: string };
+  | { kind: "team"; teamSlug: string }
+  | { kind: "authored" };
 
 export interface FilterContext {
   viewer: string;
   /** "org/team" slugs the viewer belongs to. */
   myTeams: string[];
+}
+
+function isViewer(login: string, viewer: string): boolean {
+  return login.toLowerCase() === viewer.toLowerCase();
 }
 
 function requestedFromUser(pr: PullRequest, login: string): boolean {
@@ -499,11 +507,13 @@ export function filterPullRequests(
   filter: PrFilter,
   context: FilterContext,
 ): PullRequest[] {
-  // Your own pull requests are never yours to review — GitHub will not even
-  // accept a self-review — so they are not part of this list under any filter.
-  const reviewable = prs.filter(
-    (pr) => pr.author.toLowerCase() !== context.viewer.toLowerCase(),
-  );
+  // The one filter that is explicitly about your own work.
+  if (filter.kind === "authored") {
+    return prs.filter((pr) => isViewer(pr.author, context.viewer));
+  }
+  // Everywhere else your own pull requests are not yours to review — GitHub
+  // will not even accept a self-review — so they are left out.
+  const reviewable = prs.filter((pr) => !isViewer(pr.author, context.viewer));
   switch (filter.kind) {
     case "all":
       return reviewable;

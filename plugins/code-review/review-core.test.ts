@@ -242,6 +242,37 @@ describe("filterPullRequests", () => {
     expect(filterPullRequests([own], { kind: "all" }, context)).toEqual([]);
   });
 
+  it("shows only your own pull requests under `authored`", () => {
+    const own = pr({ number: 9, author: "robennals" });
+    const theirs = pr({ number: 12, author: "dan" });
+    expect(
+      filterPullRequests([...all, own, theirs], { kind: "authored" }, context).map(
+        (entry) => entry.number,
+      ),
+    ).toEqual([9]);
+  });
+
+  it("matches your login case-insensitively under `authored` too", () => {
+    const own = pr({ number: 13, author: "RobEnnals" });
+    expect(filterPullRequests([own], { kind: "authored" }, context)).toHaveLength(1);
+  });
+
+  it("keeps `authored` and `mine` apart", () => {
+    // A review requested from you on someone else's PR, and your own PR with
+    // no request: neither filter should catch the other's.
+    const requested = pr({
+      number: 14,
+      author: "dan",
+      reviewRequests: [{ login: "robennals", teamSlug: null }],
+    });
+    const own = pr({ number: 15, author: "robennals" });
+    const both = [requested, own];
+    expect(filterPullRequests(both, { kind: "mine" }, context).map((e) => e.number)).toEqual([14]);
+    expect(filterPullRequests(both, { kind: "authored" }, context).map((e) => e.number)).toEqual([
+      15,
+    ]);
+  });
+
   it("keeps other people's pull requests", () => {
     const theirs = pr({ number: 11, author: "dan" });
     expect(filterPullRequests([theirs], { kind: "all" }, context)).toHaveLength(1);

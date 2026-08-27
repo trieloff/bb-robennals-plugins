@@ -44,10 +44,12 @@ const CONTEXT_STEPS = [3, 25, 100] as const;
 
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 type PrFilter =
+  // "mine" is a review requested from you; "authored" is a PR you opened.
   | { kind: "all" }
   | { kind: "mine" }
   | { kind: "my-teams" }
-  | { kind: "team"; teamSlug: string };
+  | { kind: "team"; teamSlug: string }
+  | { kind: "authored" };
 
 /** One place a finding points at, with its code. Mirrors the RPC output. */
 interface LocationDto {
@@ -359,7 +361,7 @@ function DiscussionTab() {
 // The PR list
 // ---------------------------------------------------------------------------
 
-type FilterTab = "mine" | "teams" | "all";
+type FilterTab = "mine" | "teams" | "all" | "authored";
 
 function tabAndTeamFor(filter: PrFilter): { tab: FilterTab; team: string } {
   switch (filter.kind) {
@@ -371,6 +373,8 @@ function tabAndTeamFor(filter: PrFilter): { tab: FilterTab; team: string } {
       return { tab: "teams", team: ANY_TEAM };
     case "team":
       return { tab: "teams", team: filter.teamSlug };
+    case "authored":
+      return { tab: "authored", team: ANY_TEAM };
   }
 }
 
@@ -505,6 +509,7 @@ function PrListView({
           onValueChange={(next) => {
             if (next === "all") onFilterChange({ kind: "all" });
             else if (next === "mine") onFilterChange({ kind: "mine" });
+            else if (next === "authored") onFilterChange({ kind: "authored" });
             else {
               onFilterChange(
                 team === ANY_TEAM ? { kind: "my-teams" } : { kind: "team", teamSlug: team },
@@ -521,6 +526,9 @@ function PrListView({
             </TabsTrigger>
             <TabsTrigger value="all" className="text-xs">
               All open
+            </TabsTrigger>
+            <TabsTrigger value="authored" className="text-xs">
+              Mine
             </TabsTrigger>
           </TabsList>
         </Tabs>
@@ -594,13 +602,15 @@ function PrListView({
       ) : data === null || data.pullRequests.length === 0 ? (
         <EmptyState
           icon="GitPullRequest"
-          title="Nothing to review"
+          title={tab === "authored" ? "Nothing here" : "Nothing to review"}
           detail={
             tab === "mine"
               ? "No open pull request in this repo has a review request for you."
               : tab === "teams"
                 ? "No open pull request in this repo has a review request for these teams."
-                : "This repo has no open pull requests from anyone else."
+                : tab === "authored"
+                  ? "You have no open pull requests in this repo."
+                  : "This repo has no open pull requests from anyone else."
           }
         />
       ) : (

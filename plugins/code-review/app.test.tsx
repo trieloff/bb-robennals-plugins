@@ -921,3 +921,66 @@ describe("the order of an issue view", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("the Mine tab", () => {
+  const clickTab = (element: HTMLElement) => {
+    // Radix tabs activate on mousedown, not click.
+    fireEvent.mouseDown(element);
+    fireEvent.focus(element);
+    fireEvent.click(element);
+  };
+
+  it("asks for the pull requests you opened, not ones assigned to you", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    await slot.findByText("Add a thing");
+    clickTab((await slot.findByText("Mine")).closest("button") as HTMLElement);
+    await waitFor(() => {
+      const last = slot.inspection.rpcCalls
+        .filter((entry) => entry.method === "listPullRequests")
+        .at(-1);
+      expect((last?.input as { filter: { kind: string } }).filter.kind).toBe("authored");
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("is remembered like any other filter", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    await slot.findByText("Add a thing");
+    clickTab((await slot.findByText("Mine")).closest("button") as HTMLElement);
+    await waitFor(() => {
+      const saved = slot.inspection.rpcCalls.find((entry) => entry.method === "setPanelState");
+      expect((saved?.input as { filter: { kind: string } })?.filter?.kind).toBe("authored");
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("restores onto the Mine tab when that is what was saved", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      { rpc: rpc({ getPanelState: () => ({ repo: "acme/app", filter: { kind: "authored" } }) }) },
+    );
+    await waitFor(() => {
+      const last = slot.inspection.rpcCalls
+        .filter((entry) => entry.method === "listPullRequests")
+        .at(-1);
+      expect((last?.input as { filter: { kind: string } }).filter.kind).toBe("authored");
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("says something different when you have no open pull requests", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      { rpc: rpc({ listPullRequests: () => ({ fetchedAt: "", pullRequests: [] }) }) },
+    );
+    clickTab((await slot.findByText("Mine")).closest("button") as HTMLElement);
+    await slot.findByText("You have no open pull requests in this repo.");
+    slot.lifecycle.unmount();
+  });
+});

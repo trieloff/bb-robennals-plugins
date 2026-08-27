@@ -180,6 +180,7 @@ const filterSchema = z.union([
   z.object({ kind: z.literal("mine") }),
   z.object({ kind: z.literal("my-teams") }),
   z.object({ kind: z.literal("team"), teamSlug: z.string() }),
+  z.object({ kind: z.literal("authored") }),
 ]);
 
 const codeLocationSchema = z.object({
