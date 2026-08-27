@@ -170,6 +170,21 @@ describe("the pull request list", () => {
     slot.lifecycle.unmount();
   });
 
+  it("says the list excludes your own pull requests when it is empty", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      { rpc: rpc({ listPullRequests: () => ({ fetchedAt: "", pullRequests: [] }) }) },
+    );
+    const allTab = (await slot.findByText("All open")).closest("button") as HTMLElement;
+    fireEvent.mouseDown(allTab);
+    fireEvent.focus(allTab);
+    fireEvent.click(allTab);
+    await slot.findByText("This repo has no open pull requests from anyone else.");
+    slot.lifecycle.unmount();
+  });
+
   it("explains an empty list instead of showing a blank page", async () => {
     const app = await load();
     const slot = renderSlot(

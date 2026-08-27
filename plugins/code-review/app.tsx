@@ -600,7 +600,7 @@ function PrListView({
               ? "No open pull request in this repo has a review request for you."
               : tab === "teams"
                 ? "No open pull request in this repo has a review request for these teams."
-                : "This repo has no open pull requests."
+                : "This repo has no open pull requests from anyone else."
           }
         />
       ) : (

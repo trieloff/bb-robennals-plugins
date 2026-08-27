@@ -499,15 +499,22 @@ export function filterPullRequests(
   filter: PrFilter,
   context: FilterContext,
 ): PullRequest[] {
+  // Your own pull requests are never yours to review — GitHub will not even
+  // accept a self-review — so they are not part of this list under any filter.
+  const reviewable = prs.filter(
+    (pr) => pr.author.toLowerCase() !== context.viewer.toLowerCase(),
+  );
   switch (filter.kind) {
     case "all":
-      return prs;
+      return reviewable;
     case "mine":
-      return prs.filter((pr) => requestedFromUser(pr, context.viewer));
+      return reviewable.filter((pr) => requestedFromUser(pr, context.viewer));
     case "my-teams":
-      return prs.filter((pr) => context.myTeams.some((team) => requestedFromTeam(pr, team)));
+      return reviewable.filter((pr) =>
+        context.myTeams.some((team) => requestedFromTeam(pr, team)),
+      );
     case "team":
-      return prs.filter((pr) => requestedFromTeam(pr, filter.teamSlug));
+      return reviewable.filter((pr) => requestedFromTeam(pr, filter.teamSlug));
   }
 }
 

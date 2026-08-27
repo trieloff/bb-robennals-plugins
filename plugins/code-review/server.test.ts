@@ -274,6 +274,16 @@ describe("listPullRequests", () => {
     expect(await numbers({ kind: "all" })).toEqual([7, 8, 9]);
   });
 
+  it("leaves out pull requests you opened yourself", async () => {
+    const mine = { ...PR, number: 10, author: { login: "robennals" } };
+    const { call } = await makeHost({ prs: [PR, mine] });
+    const { pullRequests } = await call<{ pullRequests: Array<{ number: number }> }>(
+      "listPullRequests",
+      { repo: REPO, filter: { kind: "all" } },
+    );
+    expect(pullRequests.map((pr) => pr.number)).toEqual([7]);
+  });
+
   it("carries this plugin's review state onto each row", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     await runReview(host);

@@ -212,6 +212,40 @@ describe("filterPullRequests", () => {
   it("passes everything through for `all`", () => {
     expect(filterPullRequests(all, { kind: "all" }, context)).toHaveLength(4);
   });
+
+  it("leaves out your own pull requests, under every filter", () => {
+    // You cannot review your own PR — GitHub refuses a self-review — so it is
+    // never something this list should be offering.
+    const own = pr({
+      number: 9,
+      author: "robennals",
+      reviewRequests: [
+        { login: "robennals", teamSlug: null },
+        { login: null, teamSlug: "acme/core" },
+      ],
+    });
+    const withOwn = [...all, own];
+    for (const filter of [
+      { kind: "all" as const },
+      { kind: "mine" as const },
+      { kind: "my-teams" as const },
+      { kind: "team" as const, teamSlug: "acme/core" },
+    ]) {
+      expect(filterPullRequests(withOwn, filter, context).map((entry) => entry.number)).not.toContain(
+        9,
+      );
+    }
+  });
+
+  it("matches your login case-insensitively when excluding", () => {
+    const own = pr({ number: 10, author: "RobEnnals" });
+    expect(filterPullRequests([own], { kind: "all" }, context)).toEqual([]);
+  });
+
+  it("keeps other people's pull requests", () => {
+    const theirs = pr({ number: 11, author: "dan" });
+    expect(filterPullRequests([theirs], { kind: "all" }, context)).toHaveLength(1);
+  });
 });
 
 describe("parsePullRequests", () => {
