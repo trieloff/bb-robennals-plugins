@@ -10,7 +10,7 @@
     "name": "PR Manager",
     "description": "Track your pull requests and open the right BB worktree thread.",
     "branding": {
-      "icon": "GitPullRequest"
+      "icon": "./assets/icon.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx",
