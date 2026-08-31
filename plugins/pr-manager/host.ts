@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract } from "./contract.js";
 import { pullRequestSourceRef } from "./git-ref.js";
+import { mergedPullRequestSearchArgs, openPullRequestSearchArgs } from "./pr-search.js";
 import { classifyPullRequest, summarizePullRequest } from "./pr-status.js";
 
 const execFileAsync = promisify(execFile);
@@ -28,7 +29,7 @@ async function mapConcurrent<T, R>(values: T[], limit: number, mapper: (value: T
   return results;
 }
 async function search(args: string[], signal: AbortSignal): Promise<SearchResult[]> {
-  return JSON.parse(await run("gh", ["search", "prs", "--author=@me", ...args, "--json", "number,title,url,repository,createdAt,updatedAt,isDraft"], signal)) as SearchResult[];
+  return JSON.parse(await run("gh", args, signal)) as SearchResult[];
 }
 function normalizeCheck(check: PrView["statusCheckRollup"][number]) {
   const state = check.conclusion ?? check.state ?? "";
@@ -46,8 +47,8 @@ export default experimental_defineHostEntry({
       await run("gh", ["auth", "status"], context.signal);
       const since = new Date(Date.now() - mergedWithinDays * 86_400_000).toISOString().slice(0, 10);
       const [open, merged] = await Promise.all([
-        search(["--state=open", "--sort=updated", "--order=desc", `--limit=${maximumPullRequests}`], context.signal),
-        search(["--merged", `--merged-at=>=${since}`, "--sort=updated", "--order=desc", `--limit=${maximumPullRequests}`], context.signal),
+        search(openPullRequestSearchArgs(maximumPullRequests), context.signal),
+        search(mergedPullRequestSearchArgs(since, maximumPullRequests), context.signal),
       ]);
       const unique = [...new Map([...open, ...merged].map((pr) => [pr.url, pr])).values()];
       const pullRequests = await mapConcurrent(unique, 6, async (result) => {
