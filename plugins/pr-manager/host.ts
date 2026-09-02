@@ -3,15 +3,17 @@ import { promisify } from "node:util";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract } from "./contract.js";
 import { pullRequestSourceRef } from "./git-ref.js";
-import { mergedPullRequestSearchArgs, openPullRequestSearchArgs } from "./pr-search.js";
+import { mergedPullRequestQuery, openPullRequestQuery, pullRequestSearchArgs } from "./pr-search.js";
 import { classifyPullRequest, summarizePullRequest } from "./pr-status.js";
 
 const execFileAsync = promisify(execFile);
-interface SearchResult { number: number; title: string; url: string; isDraft: boolean; createdAt: string; updatedAt: string; repository: { nameWithOwner: string } }
-interface PrView {
+interface CheckContext { status?: string; conclusion?: string; state?: string }
+interface SearchResult {
   number: number; title: string; url: string; state: string; isDraft: boolean; headRefName: string; baseRefName: string;
-  reviewDecision: string | null; reviewRequests: Array<{ login?: string; name?: string; slug?: string }>;
-  statusCheckRollup: Array<{ status?: string; conclusion?: string; state?: string }>; createdAt: string; updatedAt: string; mergedAt: string | null;
+  createdAt: string; updatedAt: string; mergedAt: string | null; reviewDecision: string | null;
+  repository: { nameWithOwner: string };
+  reviewRequests: { nodes: Array<{ requestedReviewer: { login?: string; slug?: string } | null }> };
+  commits: { nodes: Array<{ commit: { statusCheckRollup: { contexts: { nodes: CheckContext[] } } | null } }> };
 }
 async function run(command: string, args: string[], signal: AbortSignal): Promise<string> {
   try {
@@ -22,16 +24,14 @@ async function run(command: string, args: string[], signal: AbortSignal): Promis
     throw new Error(`${command} failed: ${error.stderr?.trim() || error.message}`);
   }
 }
-async function mapConcurrent<T, R>(values: T[], limit: number, mapper: (value: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(values.length); let cursor = 0;
-  async function worker() { while (cursor < values.length) { const index = cursor++; results[index] = await mapper(values[index]!); } }
-  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
-  return results;
+async function search(query: string, limit: number, signal: AbortSignal): Promise<SearchResult[]> {
+  const parsed = JSON.parse(await run("gh", pullRequestSearchArgs(query, limit), signal)) as
+    { data: { search: { nodes: Array<Partial<SearchResult>> } } };
+  // `type: ISSUE` is the only search type that returns pull requests, so any
+  // node that is a plain issue comes back as the empty half of the fragment.
+  return parsed.data.search.nodes.filter((node): node is SearchResult => typeof node.number === "number");
 }
-async function search(args: string[], signal: AbortSignal): Promise<SearchResult[]> {
-  return JSON.parse(await run("gh", args, signal)) as SearchResult[];
-}
-function normalizeCheck(check: PrView["statusCheckRollup"][number]) {
+function normalizeCheck(check: CheckContext) {
   const state = check.conclusion ?? check.state ?? "";
   const status = check.status ?? (state === "PENDING" || state === "EXPECTED" ? "IN_PROGRESS" : "COMPLETED");
   return { status: status.toUpperCase(), conclusion: state.toUpperCase() };
@@ -47,20 +47,18 @@ export default experimental_defineHostEntry({
       await run("gh", ["auth", "status"], context.signal);
       const since = new Date(Date.now() - mergedWithinDays * 86_400_000).toISOString().slice(0, 10);
       const [open, merged] = await Promise.all([
-        search(openPullRequestSearchArgs(maximumPullRequests), context.signal),
-        search(mergedPullRequestSearchArgs(since, maximumPullRequests), context.signal),
+        search(openPullRequestQuery(), maximumPullRequests, context.signal),
+        search(mergedPullRequestQuery(since), maximumPullRequests, context.signal),
       ]);
       const unique = [...new Map([...open, ...merged].map((pr) => [pr.url, pr])).values()];
-      const pullRequests = await mapConcurrent(unique, 6, async (result) => {
-        const repository = result.repository.nameWithOwner;
-        const view = JSON.parse(await run("gh", ["pr", "view", String(result.number), "--repo", repository,
-          "--json", "number,title,url,state,isDraft,headRefName,baseRefName,reviewDecision,reviewRequests,statusCheckRollup,createdAt,updatedAt,mergedAt"], context.signal)) as PrView;
-        const requestedReviewers = view.reviewRequests.map((reviewer) => reviewer.login ?? reviewer.name ?? reviewer.slug)
+      const pullRequests = unique.map((view) => {
+        const requestedReviewers = view.reviewRequests.nodes
+          .map((request) => request.requestedReviewer?.login ?? request.requestedReviewer?.slug)
           .filter((name): name is string => name !== undefined);
         const input = { state: view.state, mergedAt: view.mergedAt, isDraft: view.isDraft, reviewDecision: view.reviewDecision ?? "",
-          requestedReviewers, checks: view.statusCheckRollup.map(normalizeCheck) };
+          requestedReviewers, checks: (view.commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? []).map(normalizeCheck) };
         const status = classifyPullRequest(input);
-        return { repository, number: view.number, title: view.title, url: view.url, status,
+        return { repository: view.repository.nameWithOwner, number: view.number, title: view.title, url: view.url, status,
           summary: summarizePullRequest(input, status), isDraft: view.isDraft, headRefName: view.headRefName,
           baseRefName: view.baseRefName, createdAt: view.createdAt, updatedAt: view.updatedAt, mergedAt: view.mergedAt };
       });
