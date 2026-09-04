@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { mergedPullRequestQuery, openPullRequestQuery, pullRequestSearchArgs } from "./pr-search.js";
+import {
+  mergedPullRequestQuery, openPullRequestQuery, PULL_REQUEST_SEARCH_DOCUMENT, pullRequestSearchArgs,
+} from "./pr-search.js";
 
 describe("pull request search", () => {
   it("excludes archived repositories from both searches", () => {
@@ -25,5 +27,21 @@ describe("pull request search", () => {
     for (const field of ["reviewDecision", "reviewRequests", "statusCheckRollup", "mergedAt", "isDraft"]) {
       expect(document).toContain(field);
     }
+  });
+
+  it("selects every kind of requested reviewer", () => {
+    // A pending Bot review — a Copilot review request — keeps a PR out of
+    // APPROVED, so dropping the fragment would mis-classify it.
+    const document = PULL_REQUEST_SEARCH_DOCUMENT;
+    for (const fragment of ["on User", "on Team", "on Bot", "on Mannequin"]) {
+      expect(document).toContain(fragment);
+    }
+  });
+
+  it("can tell a truncated check rollup from a complete one", () => {
+    // Without totalCount and the rollup state, a commit with more than one page
+    // of contexts is classified from its first page alone.
+    expect(PULL_REQUEST_SEARCH_DOCUMENT).toContain("totalCount");
+    expect(PULL_REQUEST_SEARCH_DOCUMENT).toMatch(/statusCheckRollup \{ state/);
   });
 });

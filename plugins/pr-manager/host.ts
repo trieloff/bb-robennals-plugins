@@ -8,12 +8,13 @@ import { classifyPullRequest, summarizePullRequest } from "./pr-status.js";
 
 const execFileAsync = promisify(execFile);
 interface CheckContext { status?: string; conclusion?: string; state?: string }
+interface StatusCheckRollup { state?: string; contexts: { totalCount: number; nodes: CheckContext[] } }
 interface SearchResult {
   number: number; title: string; url: string; state: string; isDraft: boolean; headRefName: string; baseRefName: string;
   createdAt: string; updatedAt: string; mergedAt: string | null; reviewDecision: string | null;
   repository: { nameWithOwner: string };
   reviewRequests: { nodes: Array<{ requestedReviewer: { login?: string; slug?: string } | null }> };
-  commits: { nodes: Array<{ commit: { statusCheckRollup: { contexts: { nodes: CheckContext[] } } | null } }> };
+  commits: { nodes: Array<{ commit: { statusCheckRollup: StatusCheckRollup | null } }> };
 }
 async function run(command: string, args: string[], signal: AbortSignal): Promise<string> {
   try {
@@ -30,6 +31,16 @@ async function search(query: string, limit: number, signal: AbortSignal): Promis
   // `type: ISSUE` is the only search type that returns pull requests, so any
   // node that is a plain issue comes back as the empty half of the fragment.
   return parsed.data.search.nodes.filter((node): node is SearchResult => typeof node.number === "number");
+}
+function rollupChecks(rollup: StatusCheckRollup | null | undefined): CheckContext[] {
+  if (!rollup) return [];
+  // A head commit with more than one page of contexts would otherwise be
+  // classified from the first page alone, hiding a failure further down. The
+  // rollup's own state is computed over every context, so when the page is
+  // short one synthetic check stands in for the contexts not fetched — cheaper,
+  // and far less fragile, than paginating a connection per pull request.
+  const truncated = rollup.contexts.totalCount > rollup.contexts.nodes.length;
+  return truncated ? [...rollup.contexts.nodes, { state: rollup.state }] : rollup.contexts.nodes;
 }
 function normalizeCheck(check: CheckContext) {
   const state = check.conclusion ?? check.state ?? "";
@@ -56,7 +67,7 @@ export default experimental_defineHostEntry({
           .map((request) => request.requestedReviewer?.login ?? request.requestedReviewer?.slug)
           .filter((name): name is string => name !== undefined);
         const input = { state: view.state, mergedAt: view.mergedAt, isDraft: view.isDraft, reviewDecision: view.reviewDecision ?? "",
-          requestedReviewers, checks: (view.commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? []).map(normalizeCheck) };
+          requestedReviewers, checks: rollupChecks(view.commits.nodes[0]?.commit.statusCheckRollup).map(normalizeCheck) };
         const status = classifyPullRequest(input);
         return { repository: view.repository.nameWithOwner, number: view.number, title: view.title, url: view.url, status,
           summary: summarizePullRequest(input, status), isDraft: view.isDraft, headRefName: view.headRefName,

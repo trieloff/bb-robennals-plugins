@@ -8,11 +8,14 @@ export const PULL_REQUEST_SEARCH_DOCUMENT = `query($q: String!, $limit: Int!) {
         number title url state isDraft headRefName baseRefName
         createdAt updatedAt mergedAt reviewDecision
         repository { nameWithOwner }
-        reviewRequests(first: 20) {
-          nodes { requestedReviewer { ... on User { login } ... on Team { slug } ... on Mannequin { login } } }
+        reviewRequests(first: 100) {
+          nodes { requestedReviewer {
+            ... on User { login } ... on Team { slug } ... on Bot { login } ... on Mannequin { login }
+          } }
         }
         commits(last: 1) {
-          nodes { commit { statusCheckRollup { contexts(first: 100) {
+          nodes { commit { statusCheckRollup { state contexts(first: 100) {
+            totalCount
             nodes { ... on CheckRun { status conclusion } ... on StatusContext { state } }
           } } } }
         }
